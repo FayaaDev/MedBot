@@ -1,0 +1,31 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "medbot",
+	"main": "src/index.js",
+	"compatibility_date": "2026-05-01",
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"triggers": {
+		"crons": [
+			"0 6 * * *"
+		]
+	},
+	"kv_namespaces": [
+		{
+			"binding": "MEDBOT_KV",
+			"id": "0ba33a3a017b47338b67161cccdabddb"
+		}
+	],
+	"vars": {
+		"NCBI_TOOL": "MedBot",
+		"DIGEST_MAX_ARTICLES": "5",
+		"HIGH_EVIDENCE_LIMIT": "3",
+		"OBSERVATIONAL_LIMIT": "2",
+		"RELATED_RECORD_LIMIT": "0",
+		"ENTREZ_LOOKBACK_DAYS": "2",
+		"MIN_SCORE": "20",
+		"SEND_EMPTY_DIGEST": "true"
+	}
+}
