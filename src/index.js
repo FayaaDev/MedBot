@@ -537,10 +537,6 @@ async function selectDigestItems(env, primaryItems, relatedRecords, config) {
   const overflowCandidates = [];
 
   for (const item of primaryItems) {
-    if (item.score < config.minScore) {
-      continue;
-    }
-
     const key = `${item.db}:${item.id}`;
     if (selectedIds.has(key)) {
       continue;
@@ -568,8 +564,7 @@ async function selectDigestItems(env, primaryItems, relatedRecords, config) {
   );
   const overflow = await pickUnsents(env, overflowCandidates, Math.max(0, articleLimit - highEvidence.length - observational.length), selectedIds);
 
-  const relatedCandidates = relatedRecords.filter((item) => item.score >= Math.max(10, config.minScore - 8));
-  const related = await pickUnsents(env, relatedCandidates, config.relatedRecordLimit, selectedIds);
+  const related = await pickUnsents(env, relatedRecords, config.relatedRecordLimit, selectedIds);
 
   return {
     highEvidence,
@@ -840,7 +835,6 @@ function getConfig(env, options = {}) {
     observationalLimit: parseNumber(env.OBSERVATIONAL_LIMIT, 5),
     relatedRecordLimit: parseNumber(env.RELATED_RECORD_LIMIT, 3),
     lookbackDays: parseNumber(env.ENTREZ_LOOKBACK_DAYS, 2),
-    minScore: parseNumber(env.MIN_SCORE, 20),
     sendEmptyDigest: parseBoolean(env.SEND_EMPTY_DIGEST, false),
   };
 }
@@ -857,7 +851,6 @@ function publicConfig(config) {
     observationalLimit: config.observationalLimit,
     relatedRecordLimit: config.relatedRecordLimit,
     lookbackDays: config.lookbackDays,
-    minScore: config.minScore,
     sendEmptyDigest: config.sendEmptyDigest,
   };
 }
