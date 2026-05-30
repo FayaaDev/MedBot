@@ -4,3 +4,5 @@ npm-debug.log*
 .env
 .DS_Store
 *:Zone.Identifier
+AGENTS.md
+MedBot.md
