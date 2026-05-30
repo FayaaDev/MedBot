@@ -1,13 +1,13 @@
 # MedBot
 
-Cloudflare Worker that builds and sends a daily Telegram digest of recent Entrez records related to malaria, plasmodium, and anopheles.
+A telegram bot that sends daily or weekly a pre-defined number (up to 18) recent articles based on predefined criteria. It uses Entrez API which gives access to a number of databases including PubMed. 
+In this version, the bot is programmed to retrieve Malaria articles.
 
 ## What It Does
 
-- Runs daily at 06:00 UTC, which corresponds to 09:00 GMT+3.
+- Runs daily at 09:00 GMT+3.
 - Uses Entrez `EGQuery` for cross-database discovery.
 - Searches PubMed, PMC, and Bookshelf for digest articles.
-- Searches Gene, Protein, Nucleotide, SNP, Taxonomy, and MeSH for a small related-record section.
 - Scores records by evidence type, topic relevance, recency, abstract availability, and DOI metadata.
 - Stores sent IDs in Workers KV so the same record is not sent twice.
 - Exposes protected `/preview`, `/run`, and `/last` endpoints for manual testing.
@@ -16,7 +16,6 @@ Cloudflare Worker that builds and sends a daily Telegram digest of recent Entrez
 
 - `src/index.js`: Worker entrypoint with scheduled and HTTP handlers
 - `wrangler.jsonc`: Worker config, cron schedule, KV binding, and variables
-- `MedBot.md`: implementation plan used for this Worker
 
 ## Required Secrets
 
@@ -27,13 +26,12 @@ Set these with `wrangler secret put`:
 - `NCBI_API_KEY`
 - `NCBI_EMAIL`
 - `ADMIN_TOKEN`
-- `TELEGRAM_WEBHOOK_SECRET` (optional, recommended)
 
 ## KV Setup
 Preview stored article keys:
-npx wrangler kv key list --remote --namespace-id 0ba33a3a017b47338b67161cccdabddb --prefix "sent:"
+npx wrangler kv key list --remote --namespace-id xxx --prefix "sent:"
 See last run:
-npx wrangler kv key get --remote --namespace-id 0ba33a3a017b47338b67161cccdabddb "run:last"
+npx wrangler kv key get --remote --namespace-id xxx "run:last"
 
 Create a KV namespace and put its ID into `wrangler.jsonc`:
 
@@ -54,7 +52,7 @@ With scheduled testing enabled, Wrangler exposes `http://localhost:8787/__schedu
 
 Current production schedule:
 
-- `0 6 * * *` (daily at 06:00 UTC / 09:00 GMT+3)
+- `0 6 * * *` (daily at 09:00 GMT+3)
 
 Protected routes require one of:
 
@@ -93,6 +91,3 @@ If you set `TELEGRAM_WEBHOOK_SECRET`, configure the Telegram webhook with the sa
 ## Notes
 
 - The Worker expects a KV binding named `MEDBOT_KV`.
-- Sent IDs are kept for a year.
-- Telegram messages are split automatically when a digest is too long.
-- By default the Worker does not send a daily "no results" notification unless `SEND_EMPTY_DIGEST=true` is set in `vars`.
