@@ -1,6 +1,6 @@
 # MedBot
 
-A telegram bot that sends daily or weekly a pre-defined number (up to 18) recent articles based on predefined criteria. It uses Entrez API which gives access to a number of databases including PubMed. 
+A telegram bot that sends daily recent articles based on predefined criteria. It uses Entrez API which gives access to a number of databases including PubMed. 
 In this version, the bot is programmed to retrieve Malaria articles.
 
 ## What It Does
