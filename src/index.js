@@ -1,10 +1,13 @@
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
 const ENTREZ_API_BASE = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+const WOS_API_BASE = 'https://api.clarivate.com/apis/wos-starter/v1';
 const SENT_TTL_SECONDS = 366 * 24 * 60 * 60;
 const TELEGRAM_MESSAGE_LIMIT = 3900;
 const DIGEST_STORAGE_PRETTY_TTL = 366 * 24 * 60 * 60;
 const DEFAULT_PRIMARY_RETMAX = 25;
 const DEFAULT_SECONDARY_RETMAX = 8;
+const DEFAULT_WOS_RETMAX = 10;
+const WOS_FREE_PLAN_SPACING_MS = 1100;
 
 const TOPICS = [
   {
@@ -28,8 +31,7 @@ const TOPICS = [
   },
 ];
 
-const PRIMARY_DATABASES = ['pubmed', 'pmc', 'books'];
-const SECONDARY_DATABASES = ['gene', 'protein', 'nucleotide', 'snp', 'taxonomy', 'mesh'];
+const PRIMARY_DATABASES = ['pubmed', 'pmc'];
 
 const HIGH_EVIDENCE_RULES = [
   { label: 'Randomized Controlled Trial', score: 60, matches: ['randomized controlled trial'] },
@@ -94,7 +96,7 @@ async function handleFetch(request, env) {
       service: 'medbot',
       topics: TOPICS.map((topic) => topic.label),
       primaryDatabases: PRIMARY_DATABASES,
-      secondaryDatabases: SECONDARY_DATABASES,
+      externalSources: ['entrez', 'wos'],
       scheduleUtc: '0 6 * * *',
       config: getPublicConfigFromEnv(env),
       lastRun,
@@ -227,40 +229,37 @@ async function runDigest(env, { reason, deliver, mode = 'scored' }) {
 
 async function buildDigest(env, config, mode = 'scored') {
   const entrez = createEntrezClient(env, config);
-  const discoveryEntries = await Promise.all(TOPICS.map((topic) => discoverTopic(entrez, topic)));
+  const wos = createWosClient(env, config);
+  const discoveryEntries = await Promise.all(TOPICS.map((topic) => discoverTopic(entrez, wos, topic, config)));
   const discovery = Object.fromEntries(discoveryEntries.map((entry) => [entry.topic, entry.counts]));
 
   const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.lookbackDays);
   const primaryItems = await enrichPrimaryRecords(entrez, primaryMatches, config);
-  const rankedPrimaryItems = primaryItems
+  const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config) : [];
+  const rankedPrimaryItems = [...primaryItems, ...wosPrimaryItems]
     .map((item) => scorePrimaryItem(item, config))
     .filter((item) => item.title)
     .sort(sortByScore);
 
-  const secondaryMatches = await collectSearchMatches(entrez, SECONDARY_DATABASES, DEFAULT_SECONDARY_RETMAX, config.lookbackDays);
-  const relatedRecords = await enrichRelatedRecords(entrez, secondaryMatches, config);
-
   const selection =
     mode === 'all'
       ? await selectAllMatchingItems(env, rankedPrimaryItems, config)
-      : await selectDigestItems(env, rankedPrimaryItems, relatedRecords, config);
+      : await selectDigestItems(env, rankedPrimaryItems, config);
   const messageText = formatDigest(selection, discovery, config, mode);
   const digestDate = new Date().toISOString().slice(0, 10);
 
   return {
-    hasContent: selection.highEvidence.length + selection.observational.length + selection.related.length > 0,
+    hasContent: selection.highEvidence.length + selection.observational.length > 0,
     messageText,
     summary: selection.summary,
     discovery,
     selectedCounts: {
       highEvidence: selection.highEvidence.length,
       observational: selection.observational.length,
-      related: selection.related.length,
     },
     sentKeys: [
       ...selection.highEvidence.map((item) => sentKey(item.db, item.id)),
       ...selection.observational.map((item) => sentKey(item.db, item.id)),
-      ...selection.related.map((item) => sentKey(item.db, item.id)),
     ],
     storagePayload: {
       digestDate,
@@ -274,16 +273,32 @@ async function buildDigest(env, config, mode = 'scored') {
   };
 }
 
-async function discoverTopic(entrez, topic) {
+async function discoverTopic(entrez, wos, topic, config) {
   const counts = {};
+  const countEntries = await Promise.all([
+    ...PRIMARY_DATABASES.map(async (db) => {
+      const response = await entrez.json('esearch.fcgi', {
+        db,
+        term: buildSearchQuery(db, topic),
+        retmax: 0,
+      });
 
-  for (const db of PRIMARY_DATABASES) {
-    const response = await entrez.json('esearch.fcgi', {
-      db,
-      term: buildSearchQuery(db, topic),
-      retmax: 0,
-    });
-    counts[db] = Number(response?.esearchresult?.count || 0);
+      return [db, Number(response?.esearchresult?.count || 0)];
+    }),
+    wos
+      ? wos.documents({
+          db: config.wosDb,
+          q: buildWosSearchQuery(topic),
+          limit: 1,
+          page: 1,
+          sortField: config.wosSort,
+          publishTimeSpan: buildDateRange(config.lookbackDays),
+        }).then((response) => ['wos', Number(response?.metadata?.total || 0)])
+      : Promise.resolve(['wos', 0]),
+  ]);
+
+  for (const [key, value] of countEntries) {
+    counts[key] = value;
   }
 
   return {
@@ -346,25 +361,38 @@ async function enrichPrimaryRecords(entrez, matches) {
   return items;
 }
 
-async function enrichRelatedRecords(entrez, matches, config) {
-  const grouped = groupBy(matches, (match) => match.db);
-  const items = [];
+async function collectWosPrimaryItems(wos, config) {
+  const merged = new Map();
+  const publishTimeSpan = buildDateRange(config.lookbackDays);
 
-  for (const [db, dbMatches] of grouped) {
-    const ids = dbMatches.map((match) => match.id);
-    const summaries = await fetchSummaries(entrez, db, ids);
+  for (const topic of TOPICS) {
+    const response = await wos.documents({
+      db: config.wosDb,
+      q: buildWosSearchQuery(topic),
+      limit: config.wosRetmax,
+      page: 1,
+      sortField: config.wosSort,
+      publishTimeSpan,
+    });
 
-    for (const match of dbMatches) {
-      const summary = summaries.get(match.id);
-      if (!summary) {
+    for (const hit of response?.hits || []) {
+      const key = String(hit?.uid || '');
+      if (!key) {
         continue;
       }
 
-      items.push(scoreRelatedRecord(normalizeRelatedRecord(db, match, summary), config));
+      const existing = merged.get(key) || { document: hit, matchedTopics: new Set() };
+      existing.matchedTopics.add(topic.label);
+      if (!existing.document?.title && hit?.title) {
+        existing.document = hit;
+      }
+      merged.set(key, existing);
     }
   }
 
-  return items.sort(sortByScore);
+  return Array.from(merged.values()).map(({ document, matchedTopics }) =>
+    normalizeWosPrimaryRecord(document, Array.from(matchedTopics))
+  );
 }
 
 async function fetchSummaries(entrez, db, ids) {
@@ -452,21 +480,32 @@ function normalizePrimaryRecord(db, match, summary, details) {
   };
 }
 
-function normalizeRelatedRecord(db, match, summary) {
-  const title = cleanText(
-    summary.title || summary.name || summary.caption || summary.description || summary.organism || summary.uid || ''
-  );
-  const subtitle = cleanText(summary.description || summary.summary || summary.caption || summary.organism || '');
-  const pubDate = normalizeDate(summary.pubdate || summary.createdate || summary.updatedate || '');
+function normalizeWosPrimaryRecord(document, matchedTopics) {
+  const authors = Array.isArray(document?.names?.authors)
+    ? document.names.authors.map((author) => cleanText(author?.displayName || '')).filter(Boolean)
+    : [];
+  const publicationTypes = uniqueStrings([
+    ...(Array.isArray(document?.types) ? document.types : []),
+    ...(Array.isArray(document?.sourceTypes) ? document.sourceTypes : []),
+  ]);
+  const keywords = Array.isArray(document?.keywords?.authorKeywords)
+    ? document.keywords.authorKeywords.map((keyword) => cleanText(keyword)).filter(Boolean)
+    : [];
 
   return {
-    db,
-    id: match.id,
-    title,
-    subtitle,
-    matchedTopics: match.matchedTopics,
-    pubDate,
-    sourceUrl: buildSourceUrl(db, match.id),
+    db: 'wos',
+    id: cleanText(document?.uid || ''),
+    title: cleanText(document?.title || ''),
+    journal: cleanText(document?.source?.sourceTitle || 'Web of Science'),
+    publicationTypes,
+    authors,
+    doi: cleanText(document?.identifiers?.doi || ''),
+    abstract: keywords.length ? `Keywords: ${keywords.join(', ')}` : '',
+    pubDate: normalizeDate(buildWosPubDate(document?.source)),
+    sourceUrl: cleanText(document?.links?.record || ''),
+    matchedTopics,
+    pmid: cleanText(document?.identifiers?.pmid || ''),
+    timesCited: extractWosTimesCited(document?.citations),
   };
 }
 
@@ -496,6 +535,10 @@ function scorePrimaryItem(item, config) {
     }
   }
 
+  if (item.db === 'wos') {
+    score += 5;
+  }
+
   return {
     ...item,
     score,
@@ -505,33 +548,9 @@ function scorePrimaryItem(item, config) {
   };
 }
 
-function scoreRelatedRecord(item, config) {
-  let score = 0;
-  if (item.matchedTopics.length > 0) {
-    score += 12;
-  }
-  if (item.matchedTopics.length > 1) {
-    score += 5;
-  }
-  if (item.title) {
-    score += 4;
-  }
-  if (item.subtitle) {
-    score += 3;
-  }
-  if (isRecentWithinDays(item.pubDate, config.lookbackDays)) {
-    score += 4;
-  }
-
-  return {
-    ...item,
-    score,
-  };
-}
-
-async function selectDigestItems(env, primaryItems, relatedRecords, config) {
+async function selectDigestItems(env, primaryItems, config) {
   const selectedIds = new Set();
-  const articleLimit = Math.max(0, config.digestMaxArticles - config.relatedRecordLimit);
+  const articleLimit = Math.max(0, config.digestMaxArticles);
   const highEvidenceCandidates = [];
   const observationalCandidates = [];
   const overflowCandidates = [];
@@ -564,15 +583,11 @@ async function selectDigestItems(env, primaryItems, relatedRecords, config) {
   );
   const overflow = await pickUnsents(env, overflowCandidates, Math.max(0, articleLimit - highEvidence.length - observational.length), selectedIds);
 
-  const related = await pickUnsents(env, relatedRecords, config.relatedRecordLimit, selectedIds);
-
   return {
     highEvidence,
     observational: [...observational, ...overflow],
-    related,
     summary: {
       consideredPrimary: primaryItems.length,
-      relatedCandidates: relatedRecords.length,
     },
   };
 }
@@ -610,10 +625,8 @@ async function selectAllMatchingItems(env, primaryItems, config) {
   return {
     highEvidence: articles,
     observational: [],
-    related: [],
     summary: {
       consideredPrimary: primaryItems.length,
-      relatedCandidates: 0,
     },
   };
 }
@@ -621,8 +634,8 @@ async function selectAllMatchingItems(env, primaryItems, config) {
 function formatDigest(selection, discovery, config, mode = 'scored') {
   const lines = ['MedBot Daily Digest: Malaria, Plasmodium, Anopheles', ''];
 
-  if (selection.highEvidence.length === 0 && selection.observational.length === 0 && selection.related.length === 0) {
-    lines.push('No high-signal Entrez records matched this week for Malaria, Plasmodium, or Anopheles.');
+  if (selection.highEvidence.length === 0 && selection.observational.length === 0) {
+    lines.push('No high-signal records matched this week for Malaria, Plasmodium, or Anopheles.');
     return lines.join('\n');
   }
 
@@ -640,9 +653,6 @@ function formatDigest(selection, discovery, config, mode = 'scored') {
   lines.push('');
   lines.push('Observational Studies');
   lines.push(...formatPrimarySection(selection.observational, selection.highEvidence.length + 1));
-  lines.push('');
-  lines.push('Related Entrez records');
-  lines.push(...formatRelatedSection(selection.related));
   lines.push('');
   lines.push(`Discovery window: last ${config.lookbackDays} days`);
   lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery)}`);
@@ -680,21 +690,6 @@ function formatPrimarySection(items, startIndex) {
     lines.push('');
     return lines;
   });
-}
-
-function formatRelatedSection(items) {
-  if (items.length === 0) {
-    return ['None selected this week.'];
-  }
-
-  return items.flatMap((item) => [
-    `Related record: ${item.db.toUpperCase()}`,
-    `Title: ${item.title}`,
-    `Reason: matched ${item.matchedTopics.join(', ')} this week.`,
-    item.subtitle ? `Detail: ${truncateText(item.subtitle, 180)}` : null,
-    `Record: ${item.sourceUrl}`,
-    '',
-  ]).filter(Boolean);
 }
 
 async function sendTelegramDigest(telegram, chatId, messageText) {
@@ -790,26 +785,65 @@ function createEntrezClient(env, config) {
   };
 }
 
-async function fetchWithRetry(url, attempts = 3) {
+function createWosClient(env, config) {
+  const apiKey = env.WOS_STARTER_API_KEY || '';
+  if (!config.wosEnabled || !apiKey) {
+    return null;
+  }
+
+  let lastRequestAt = 0;
+
+  async function request(path, params) {
+    const now = Date.now();
+    const waitMs = Math.max(0, WOS_FREE_PLAN_SPACING_MS - (now - lastRequestAt));
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+
+    const searchParams = new URLSearchParams(stringifyParams(params));
+    const response = await fetchWithRetry(`${WOS_API_BASE}${path}?${searchParams.toString()}`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'MedBot/1.0 (+Web of Science Starter digest bot)',
+        'X-ApiKey': apiKey,
+      },
+      errorLabel: 'WoS request',
+    });
+    lastRequestAt = Date.now();
+
+    return response.json();
+  }
+
+  return {
+    documents(params) {
+      return request('/documents', params);
+    },
+  };
+}
+
+async function fetchWithRetry(url, options = {}) {
+  const attempts = options.attempts || 3;
+  const headers = options.headers || {
+    Accept: 'application/json, text/xml;q=0.9, */*;q=0.8',
+    'User-Agent': 'MedBot/1.0 (+NCBI E-utilities daily digest bot)',
+  };
+  const errorLabel = options.errorLabel || 'Entrez request';
   let lastError;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const response = await fetch(url, {
-        headers: {
-          Accept: 'application/json, text/xml;q=0.9, */*;q=0.8',
-          'User-Agent': 'MedBot/1.0 (+NCBI E-utilities daily digest bot)',
-        },
+        headers,
       });
 
       if (response.status === 429 || response.status >= 500) {
-        lastError = new Error(`Entrez request failed with status ${response.status}`);
+        lastError = new Error(`${errorLabel} failed with status ${response.status}`);
         await sleep(500 * (attempt + 1));
         continue;
       }
 
       if (!response.ok) {
-        throw new Error(`Entrez request failed with status ${response.status}`);
+        throw new Error(`${errorLabel} failed with status ${response.status}`);
       }
 
       return response;
@@ -821,7 +855,7 @@ async function fetchWithRetry(url, attempts = 3) {
     }
   }
 
-  throw lastError || new Error('Entrez request failed');
+  throw lastError || new Error(`${errorLabel} failed`);
 }
 
 function getConfig(env, options = {}) {
@@ -833,9 +867,12 @@ function getConfig(env, options = {}) {
     digestMaxArticles: parseNumber(env.DIGEST_MAX_ARTICLES, 18),
     highEvidenceLimit: parseNumber(env.HIGH_EVIDENCE_LIMIT, 10),
     observationalLimit: parseNumber(env.OBSERVATIONAL_LIMIT, 5),
-    relatedRecordLimit: parseNumber(env.RELATED_RECORD_LIMIT, 3),
     lookbackDays: parseNumber(env.ENTREZ_LOOKBACK_DAYS, 2),
     sendEmptyDigest: parseBoolean(env.SEND_EMPTY_DIGEST, false),
+    wosEnabled: parseBoolean(env.WOS_ENABLED, true),
+    wosDb: cleanText(env.WOS_DB || 'WOS') || 'WOS',
+    wosRetmax: parseNumber(env.WOS_RETMAX, DEFAULT_WOS_RETMAX),
+    wosSort: cleanText(env.WOS_SORT || 'LD+D') || 'LD+D',
   };
 }
 
@@ -849,9 +886,12 @@ function publicConfig(config) {
     digestMaxArticles: config.digestMaxArticles,
     highEvidenceLimit: config.highEvidenceLimit,
     observationalLimit: config.observationalLimit,
-    relatedRecordLimit: config.relatedRecordLimit,
     lookbackDays: config.lookbackDays,
     sendEmptyDigest: config.sendEmptyDigest,
+    wosEnabled: config.wosEnabled,
+    wosDb: config.wosDb,
+    wosRetmax: config.wosRetmax,
+    wosSort: config.wosSort,
   };
 }
 
@@ -983,7 +1023,7 @@ function buildWhySelected(item, { evidenceType, tier }) {
 function formatDiscoverySummary(discovery) {
   return TOPICS.map((topic) => {
     const counts = discovery[topic.label] || {};
-    const parts = PRIMARY_DATABASES.map((db) => `${db}:${counts[db] || 0}`);
+    const parts = [...PRIMARY_DATABASES, 'wos'].map((db) => `${db}:${counts[db] || 0}`);
     return `${topic.label}(${parts.join(', ')})`;
   }).join(' | ');
 }
@@ -1000,6 +1040,10 @@ function formatAuthors(authors) {
 
 function buildSearchQuery(db, topic) {
   return PRIMARY_DATABASES.includes(db) ? topic.query : topic.broadQuery;
+}
+
+function buildWosSearchQuery(topic) {
+  return `TS=(${topic.broadQuery})`;
 }
 
 function splitMessage(text, limit) {
@@ -1122,6 +1166,59 @@ function normalizeDate(value) {
   }
 
   return date.toISOString().slice(0, 10);
+}
+
+function buildDateRange(days) {
+  const end = new Date();
+  const start = new Date(end.getTime() - Math.max(0, days) * 24 * 60 * 60 * 1000);
+  return `${start.toISOString().slice(0, 10)}+${end.toISOString().slice(0, 10)}`;
+}
+
+function buildWosPubDate(source) {
+  const year = String(source?.publishYear || '').trim();
+  if (!year) {
+    return '';
+  }
+
+  const month = normalizeMonth(source?.publishMonth);
+  if (!month) {
+    return year;
+  }
+
+  return `${year}-${month}-01`;
+}
+
+function normalizeMonth(value) {
+  const months = {
+    JAN: '01',
+    FEB: '02',
+    MAR: '03',
+    APR: '04',
+    MAY: '05',
+    JUN: '06',
+    JUL: '07',
+    AUG: '08',
+    SEP: '09',
+    OCT: '10',
+    NOV: '11',
+    DEC: '12',
+  };
+  const text = cleanText(value).slice(0, 3).toUpperCase();
+  return months[text] || '';
+}
+
+function extractWosTimesCited(citations) {
+  if (!Array.isArray(citations)) {
+    return 0;
+  }
+
+  for (const citation of citations) {
+    if (citation?.db === 'WOS') {
+      return Number(citation.count || 0);
+    }
+  }
+
+  return 0;
 }
 
 function isRecentWithinDays(dateText, days) {
