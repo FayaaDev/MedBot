@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "clear:kv": "node scripts/clear-app-kv.mjs",
     "check": "node --check src/index.js",
     "dev": "npx wrangler dev --test-scheduled",
     "deploy": "npx wrangler deploy"
