@@ -19,15 +19,10 @@ const TOPICS = [
   {
     label: 'Plasmodium',
     query:
-      '(Plasmodium[MeSH Terms] OR Plasmodium[Title/Abstract] OR "Plasmodium falciparum"[Title/Abstract] OR "Plasmodium vivax"[Title/Abstract])',
-    broadQuery: 'Plasmodium OR "Plasmodium falciparum" OR "Plasmodium vivax"',
-    tokens: ['plasmodium', 'plasmodium falciparum', 'plasmodium vivax'],
-  },
-  {
-    label: 'Anopheles',
-    query: '(Anopheles[MeSH Terms] OR Anopheles[Title/Abstract])',
-    broadQuery: 'Anopheles',
-    tokens: ['anopheles'],
+      '("Plasmodium falciparum"[Title/Abstract] OR "Plasmodium vivax"[Title/Abstract] OR "Plasmodium malariae"[Title/Abstract] OR "Plasmodium ovale"[Title/Abstract] OR "Plasmodium knowlesi"[Title/Abstract])',
+    broadQuery:
+      '"Plasmodium falciparum" OR "Plasmodium vivax" OR "Plasmodium malariae" OR "Plasmodium ovale" OR "Plasmodium knowlesi"',
+    tokens: ['plasmodium falciparum', 'plasmodium vivax', 'plasmodium malariae', 'plasmodium ovale', 'plasmodium knowlesi'],
   },
 ];
 
