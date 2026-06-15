@@ -1,7 +1,6 @@
 # MedBot
 
-A telegram bot that sends daily recent articles based on predefined criteria. It uses Entrez API which gives access to a number of databases including PubMed. 
-In this version, the bot is programmed to retrieve Malaria articles.
+A telegram bot that sends daily recent articles based on predefined criteria. It uses Entrez API which gives access to a number of databases including PubMed.
 
 ## What It Does
 
@@ -9,6 +8,7 @@ In this version, the bot is programmed to retrieve Malaria articles.
 - Uses Entrez `EGQuery` for cross-database discovery.
 - Searches PubMed, PMC, and Bookshelf for digest articles.
 - Scores records by evidence type, topic relevance, recency, abstract availability, and DOI metadata.
+- Loads active search keywords from Workers KV so they can be changed without redeploying.
 - Stores sent IDs in Workers KV so the same record is not sent twice.
 - Exposes protected `/preview`, `/run`, and `/last` endpoints for manual testing.
 
@@ -22,12 +22,25 @@ In this version, the bot is programmed to retrieve Malaria articles.
 Set these with `wrangler secret put`:
 
 - `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+- `TELEGRAM_CHAT_ID` (required for scheduled/manual digest delivery, not for public `/ping` access)
 - `NCBI_API_KEY`
 - `NCBI_EMAIL`
 - `ADMIN_TOKEN`
 
 ## KV Setup
+Active keywords are stored in `MEDBOT_KV` under `config:keywords`.
+
+Example value:
+
+```json
+{
+  "version": 1,
+  "terms": ["malaria", "dengue"],
+  "updatedAt": "2026-06-15T09:00:00.000Z",
+  "updatedBy": "telegram:<chatId>"
+}
+```
+
 Preview stored article keys:
 npx wrangler kv key list --remote --namespace-id xxx --prefix "sent:"
 See last run:
@@ -77,8 +90,12 @@ npm run deploy
 ## Telegram Command
 
 - `/ping`: replies with `pong`
-- `/run`: triggers a manual digest run in the configured Telegram chat
-- `/runall`: triggers a manual digest run that skips scoring and sends any matching primary articles
+- `/start`: triggers a manual digest run in the configured `TELEGRAM_CHAT_ID`
+- `/keywords`: shows the active keywords, topic signature, and whether they came from KV or fallback defaults
+- `/setkeywords malaria, dengue`: replaces the active keyword list in Workers KV
+- `Change keyword`: shows the active keywords and the `/setkeywords` usage
+
+The bot includes a reply keyboard with `/start`, `/ping`, and `Change keyword` buttons on its chat responses.
 
 To enable the chat command, point your Telegram bot webhook at:
 
@@ -87,6 +104,16 @@ https://<your-worker-domain>/telegram/webhook
 ```
 
 If you set `TELEGRAM_WEBHOOK_SECRET`, configure the Telegram webhook with the same secret token.
+
+The bot accepts Telegram commands from any chat. `/ping`, `/keywords`, and `Change keyword` reply in the caller's chat; `/start` triggers digest delivery to the configured `TELEGRAM_CHAT_ID`.
+
+`/setkeywords` is restricted to the configured `TELEGRAM_CHAT_ID` and replaces the full active keyword list. Example:
+
+```text
+/setkeywords malaria, dengue, tuberculosis
+```
+
+These responses include reply keyboard buttons for `/start`, `/ping`, and `Change keyword`.
 
 ## Notes
 

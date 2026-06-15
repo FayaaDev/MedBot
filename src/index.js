@@ -8,23 +8,10 @@ const DEFAULT_PRIMARY_RETMAX = 25;
 const DEFAULT_SECONDARY_RETMAX = 8;
 const DEFAULT_WOS_RETMAX = 10;
 const WOS_FREE_PLAN_SPACING_MS = 1100;
+const KEYWORDS_CONFIG_KEY = 'config:keywords';
+const MAX_KEYWORD_TERMS = 10;
 
-const TOPICS = [
-  {
-    label: 'Malaria',
-    query: '(malaria[MeSH Terms] OR malaria[Title/Abstract])',
-    broadQuery: 'malaria',
-    tokens: ['malaria'],
-  },
-  {
-    label: 'Plasmodium',
-    query:
-      '("Plasmodium falciparum"[Title/Abstract] OR "Plasmodium vivax"[Title/Abstract] OR "Plasmodium malariae"[Title/Abstract] OR "Plasmodium ovale"[Title/Abstract] OR "Plasmodium knowlesi"[Title/Abstract])',
-    broadQuery:
-      '"Plasmodium falciparum" OR "Plasmodium vivax" OR "Plasmodium malariae" OR "Plasmodium ovale" OR "Plasmodium knowlesi"',
-    tokens: ['plasmodium falciparum', 'plasmodium vivax', 'plasmodium malariae', 'plasmodium ovale', 'plasmodium knowlesi'],
-  },
-];
+const DEFAULT_TOPIC_TERMS = ['malaria', 'plasmodium'];
 
 const PRIMARY_DATABASES = ['pubmed', 'pmc'];
 
@@ -86,14 +73,17 @@ async function handleFetch(request, env) {
 
   if (url.pathname === '/health') {
     const lastRun = await env.MEDBOT_KV.get('run:last', 'json');
+    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
     return jsonResponse({
       ok: true,
       service: 'medbot',
-      topics: TOPICS.map((topic) => topic.label),
+      topics: config.topicLabels,
+      topicSignature: config.topicSignature,
       primaryDatabases: PRIMARY_DATABASES,
       externalSources: ['entrez', 'wos'],
       scheduleUtc: '0 6 * * *',
-      config: getPublicConfigFromEnv(env),
+      usingFallbackTopics: config.usingFallbackTopics,
+      config: publicConfig(config),
       lastRun,
     });
   }
@@ -136,18 +126,15 @@ async function handleTelegramWebhook(request, env) {
     return jsonResponse({ ok: true, ignored: true });
   }
 
-  const configuredChatId = env.TELEGRAM_CHAT_ID || '';
-  if (configuredChatId && String(chatId) !== String(configuredChatId)) {
-    return jsonResponse({ ok: true, ignored: true, reason: 'unauthorized_chat' });
-  }
-
   const command = text.split(/\s+/)[0].split('@')[0].toLowerCase();
+  const normalizedText = text.toLowerCase();
   if (command === '/ping') {
     const telegram = createTelegramClient(env);
     const response = await telegram.sendMessage(String(chatId), 'pong', {
       reply_parameters: {
         message_id: message.message_id,
       },
+      reply_markup: telegramReplyKeyboard(),
     });
 
     if (!response.ok) {
@@ -157,21 +144,128 @@ async function handleTelegramWebhook(request, env) {
     return jsonResponse({ ok: true, handled: '/ping' });
   }
 
-  if (command === '/run') {
+  if (command === '/start') {
+    const telegram = createTelegramClient(env);
+    const acknowledgement = await telegram.sendMessage(String(chatId), 'Retrieving recent article', {
+      reply_parameters: {
+        message_id: message.message_id,
+      },
+      reply_markup: telegramReplyKeyboard(),
+    });
+
+    if (!acknowledgement.ok) {
+      throw new Error(`Telegram send failed: ${acknowledgement.description || 'unknown error'}`);
+    }
+
     const result = await runDigest(env, { reason: 'telegram', deliver: true });
-    return jsonResponse({ ok: true, handled: '/run', result });
+    return jsonResponse({ ok: true, handled: '/start', result });
   }
 
-  if (command === '/runall') {
-    const result = await runDigest(env, { reason: 'telegram_runall', deliver: true, mode: 'all' });
-    return jsonResponse({ ok: true, handled: '/runall', result });
+  if (command === '/keywords') {
+    const telegram = createTelegramClient(env);
+    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
+    const response = await telegram.sendMessage(String(chatId), formatKeywordStatus(config), {
+      reply_parameters: {
+        message_id: message.message_id,
+      },
+      reply_markup: telegramReplyKeyboard(),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: '/keywords' });
+  }
+
+  if (command === '/changekeyword' || normalizedText === 'change keyword') {
+    const telegram = createTelegramClient(env);
+    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
+    const response = await telegram.sendMessage(
+      String(chatId),
+      [
+        formatKeywordStatus(config),
+        'To replace all active keywords, send:',
+        '/setkeywords malaria, dengue',
+      ].join('\n'),
+      {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+        reply_markup: telegramReplyKeyboard(),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: '/changekeyword' });
+  }
+
+  if (command === '/setkeywords') {
+    const telegram = createTelegramClient(env);
+    const configuredChatId = cleanText(env.TELEGRAM_CHAT_ID || '');
+    if (!configuredChatId || String(chatId) !== configuredChatId) {
+      const denied = await telegram.sendMessage(String(chatId), 'Keyword changes are restricted to the configured delivery chat.', {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+        reply_markup: telegramReplyKeyboard(),
+      });
+
+      if (!denied.ok) {
+        throw new Error(`Telegram send failed: ${denied.description || 'unknown error'}`);
+      }
+
+      return jsonResponse({ ok: true, handled: '/setkeywords', authorized: false });
+    }
+
+    const requestedTerms = parseKeywordTermsInput(text.slice(command.length).trim());
+    if (requestedTerms.length === 0) {
+      const usage = await telegram.sendMessage(
+        String(chatId),
+        ['Usage:', '/setkeywords malaria, dengue', `You can set up to ${MAX_KEYWORD_TERMS} keywords.`].join('\n'),
+        {
+          reply_parameters: {
+            message_id: message.message_id,
+          },
+          reply_markup: telegramReplyKeyboard(),
+        }
+      );
+
+      if (!usage.ok) {
+        throw new Error(`Telegram send failed: ${usage.description || 'unknown error'}`);
+      }
+
+      return jsonResponse({ ok: true, handled: '/setkeywords', updated: false });
+    }
+
+    await saveKeywordTerms(env, requestedTerms, `telegram:${chatId}`);
+    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
+    const updated = await telegram.sendMessage(
+      String(chatId),
+      ['Updated active keywords.', formatKeywordStatus(config)].join('\n\n'),
+      {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+        reply_markup: telegramReplyKeyboard(),
+      }
+    );
+
+    if (!updated.ok) {
+      throw new Error(`Telegram send failed: ${updated.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: '/setkeywords', updated: true, topics: config.topicLabels });
   }
 
   return jsonResponse({ ok: true, ignored: true, command });
 }
 
 async function runDigest(env, { reason, deliver, mode = 'scored' }) {
-  const config = getConfig(env, { requireDeliverySecrets: deliver });
+  const config = await loadRuntimeConfig(env, { requireDeliverySecrets: deliver });
   const startedAt = new Date().toISOString();
 
   try {
@@ -186,7 +280,7 @@ async function runDigest(env, { reason, deliver, mode = 'scored' }) {
     }
 
     const digestDate = startedAt.slice(0, 10);
-    const digestKey = `digest:${digestDate}`;
+    const digestKey = digestStorageKey(config.topicSignature, digestDate);
     const result = {
       ok: true,
       reason,
@@ -202,6 +296,8 @@ async function runDigest(env, { reason, deliver, mode = 'scored' }) {
       messageText: digest.messageText,
       discovery: digest.discovery,
       selectedCounts: digest.selectedCounts,
+      topicSignature: config.topicSignature,
+      topics: config.topicLabels,
     };
 
     await Promise.all([
@@ -225,12 +321,12 @@ async function runDigest(env, { reason, deliver, mode = 'scored' }) {
 async function buildDigest(env, config, mode = 'scored') {
   const entrez = createEntrezClient(env, config);
   const wos = createWosClient(env, config);
-  const discoveryEntries = await Promise.all(TOPICS.map((topic) => discoverTopic(entrez, wos, topic, config)));
+  const discoveryEntries = await Promise.all(config.topics.map((topic) => discoverTopic(entrez, wos, topic, config)));
   const discovery = Object.fromEntries(discoveryEntries.map((entry) => [entry.topic, entry.counts]));
 
-  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.lookbackDays);
+  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.topics, config.lookbackDays);
   const primaryItems = await enrichPrimaryRecords(entrez, primaryMatches, config);
-  const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config) : [];
+  const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config.topics, config) : [];
   const rankedPrimaryItems = [...primaryItems, ...wosPrimaryItems]
     .map((item) => scorePrimaryItem(item, config))
     .filter((item) => item.title)
@@ -253,8 +349,8 @@ async function buildDigest(env, config, mode = 'scored') {
       observational: selection.observational.length,
     },
     sentKeys: [
-      ...selection.highEvidence.map((item) => sentKey(item.db, item.id)),
-      ...selection.observational.map((item) => sentKey(item.db, item.id)),
+      ...selection.highEvidence.map((item) => sentKey(config.topicSignature, item.db, item.id)),
+      ...selection.observational.map((item) => sentKey(config.topicSignature, item.db, item.id)),
     ],
     storagePayload: {
       digestDate,
@@ -262,6 +358,8 @@ async function buildDigest(env, config, mode = 'scored') {
       discovery,
       messageText,
       generatedAt: new Date().toISOString(),
+      topicSignature: config.topicSignature,
+      topics: config.topicLabels,
       config: publicConfig(config),
       mode,
     },
@@ -302,11 +400,11 @@ async function discoverTopic(entrez, wos, topic, config) {
   };
 }
 
-async function collectSearchMatches(entrez, databases, retmax, lookbackDays) {
+async function collectSearchMatches(entrez, databases, retmax, topics, lookbackDays) {
   const merged = new Map();
 
   for (const db of databases) {
-    for (const topic of TOPICS) {
+    for (const topic of topics) {
       const response = await entrez.json('esearch.fcgi', {
         db,
         term: buildSearchQuery(db, topic),
@@ -356,11 +454,11 @@ async function enrichPrimaryRecords(entrez, matches) {
   return items;
 }
 
-async function collectWosPrimaryItems(wos, config) {
+async function collectWosPrimaryItems(wos, topics, config) {
   const merged = new Map();
   const publishTimeSpan = buildDateRange(config.lookbackDays);
 
-  for (const topic of TOPICS) {
+  for (const topic of topics) {
     const response = await wos.documents({
       db: config.wosDb,
       q: buildWosSearchQuery(topic),
@@ -569,14 +667,27 @@ async function selectDigestItems(env, primaryItems, config) {
     overflowCandidates.push(item);
   }
 
-  const highEvidence = await pickUnsents(env, highEvidenceCandidates, config.highEvidenceLimit, selectedIds);
+  const highEvidence = await pickUnsents(
+    env,
+    highEvidenceCandidates,
+    config.highEvidenceLimit,
+    selectedIds,
+    config.topicSignature
+  );
   const observational = await pickUnsents(
     env,
     observationalCandidates,
     Math.min(config.observationalLimit, Math.max(0, articleLimit - highEvidence.length)),
-    selectedIds
+    selectedIds,
+    config.topicSignature
   );
-  const overflow = await pickUnsents(env, overflowCandidates, Math.max(0, articleLimit - highEvidence.length - observational.length), selectedIds);
+  const overflow = await pickUnsents(
+    env,
+    overflowCandidates,
+    Math.max(0, articleLimit - highEvidence.length - observational.length),
+    selectedIds,
+    config.topicSignature
+  );
 
   return {
     highEvidence,
@@ -587,7 +698,7 @@ async function selectDigestItems(env, primaryItems, config) {
   };
 }
 
-async function pickUnsents(env, items, limit, selectedIds) {
+async function pickUnsents(env, items, limit, selectedIds, topicSignature) {
   const picked = [];
 
   for (const item of items) {
@@ -600,7 +711,7 @@ async function pickUnsents(env, items, limit, selectedIds) {
       continue;
     }
 
-    const alreadySent = await env.MEDBOT_KV.get(sentKey(item.db, item.id));
+    const alreadySent = await env.MEDBOT_KV.get(sentKey(topicSignature, item.db, item.id));
     if (alreadySent) {
       continue;
     }
@@ -615,7 +726,13 @@ async function pickUnsents(env, items, limit, selectedIds) {
 async function selectAllMatchingItems(env, primaryItems, config) {
   const selectedIds = new Set();
   const candidates = primaryItems.filter((item) => item.title);
-  const articles = await pickUnsents(env, candidates, config.digestMaxArticles, selectedIds);
+  const articles = await pickUnsents(
+    env,
+    candidates,
+    config.digestMaxArticles,
+    selectedIds,
+    config.topicSignature
+  );
 
   return {
     highEvidence: articles,
@@ -627,10 +744,11 @@ async function selectAllMatchingItems(env, primaryItems, config) {
 }
 
 function formatDigest(selection, discovery, config, mode = 'scored') {
-  const lines = ['MedBot Daily Digest: Malaria, Plasmodium, Anopheles', ''];
+  const topicList = formatTopicList(config.topicLabels);
+  const lines = [`MedBot Daily Digest: ${topicList}`, ''];
 
   if (selection.highEvidence.length === 0 && selection.observational.length === 0) {
-    lines.push('No high-signal records matched this week for Malaria, Plasmodium, or Anopheles.');
+    lines.push(`No high-signal records matched this week for ${topicList}.`);
     return lines.join('\n');
   }
 
@@ -639,7 +757,7 @@ function formatDigest(selection, discovery, config, mode = 'scored') {
     lines.push(...formatPrimarySection(selection.highEvidence, 1));
     lines.push('');
     lines.push(`Discovery window: last ${config.lookbackDays} days`);
-    lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery)}`);
+    lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
@@ -650,7 +768,7 @@ function formatDigest(selection, discovery, config, mode = 'scored') {
   lines.push(...formatPrimarySection(selection.observational, selection.highEvidence.length + 1));
   lines.push('');
   lines.push(`Discovery window: last ${config.lookbackDays} days`);
-  lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery)}`);
+  lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
 
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -714,6 +832,13 @@ function createTelegramClient(env) {
         ...extra,
       });
     },
+  };
+}
+
+function telegramReplyKeyboard() {
+  return {
+    keyboard: [[{ text: '/start' }, { text: '/ping' }], [{ text: 'Change keyword' }]],
+    resize_keyboard: true,
   };
 }
 
@@ -871,8 +996,20 @@ function getConfig(env, options = {}) {
   };
 }
 
-function getPublicConfigFromEnv(env) {
-  return publicConfig(getConfig(env, { requireDeliverySecrets: false }));
+async function loadRuntimeConfig(env, options = {}) {
+  const config = getConfig(env, options);
+  const topicState = await getTopicsState(env);
+
+  return {
+    ...config,
+    topics: topicState.topics,
+    topicTerms: topicState.terms,
+    topicLabels: topicState.topics.map((topic) => topic.label),
+    topicSignature: buildTopicSignature(topicState.topics),
+    usingFallbackTopics: topicState.usingFallbackTopics,
+    keywordsUpdatedAt: topicState.updatedAt,
+    keywordsUpdatedBy: topicState.updatedBy,
+  };
 }
 
 function publicConfig(config) {
@@ -887,6 +1024,12 @@ function publicConfig(config) {
     wosDb: config.wosDb,
     wosRetmax: config.wosRetmax,
     wosSort: config.wosSort,
+    topicTerms: config.topicTerms,
+    topics: config.topicLabels,
+    topicSignature: config.topicSignature,
+    usingFallbackTopics: config.usingFallbackTopics,
+    keywordsUpdatedAt: config.keywordsUpdatedAt || '',
+    keywordsUpdatedBy: config.keywordsUpdatedBy || '',
   };
 }
 
@@ -939,8 +1082,12 @@ async function markSent(env, keys) {
   );
 }
 
-function sentKey(db, id) {
-  return `sent:${db}:${id}`;
+function sentKey(topicSignature, db, id) {
+  return `sent:${topicSignature}:${db}:${id}`;
+}
+
+function digestStorageKey(topicSignature, digestDate) {
+  return `digest:${topicSignature}:${digestDate}`;
 }
 
 function buildSourceUrl(db, id) {
@@ -1015,12 +1162,129 @@ function buildWhySelected(item, { evidenceType, tier }) {
   return reasons.join(', ');
 }
 
-function formatDiscoverySummary(discovery) {
-  return TOPICS.map((topic) => {
+function formatDiscoverySummary(discovery, topics) {
+  return topics.map((topic) => {
     const counts = discovery[topic.label] || {};
     const parts = [...PRIMARY_DATABASES, 'wos'].map((db) => `${db}:${counts[db] || 0}`);
     return `${topic.label}(${parts.join(', ')})`;
   }).join(' | ');
+}
+
+function formatTopicList(topicLabels) {
+  const labels = uniqueStrings(topicLabels.map((topic) => cleanText(topic)));
+  if (labels.length === 0) {
+    return 'configured topics';
+  }
+  if (labels.length === 1) {
+    return labels[0];
+  }
+  if (labels.length === 2) {
+    return `${labels[0]} and ${labels[1]}`;
+  }
+  return `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`;
+}
+
+function formatKeywordStatus(config) {
+  const lines = [`Current keywords: ${formatTopicList(config.topicLabels)}`, `Signature: ${config.topicSignature}`];
+
+  if (config.usingFallbackTopics) {
+    lines.push('Source: fallback defaults');
+  } else {
+    lines.push('Source: Workers KV');
+  }
+
+  if (config.keywordsUpdatedAt) {
+    lines.push(`Updated: ${config.keywordsUpdatedAt}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function getTopicsState(env) {
+  const stored = await env.MEDBOT_KV.get(KEYWORDS_CONFIG_KEY, 'json').catch(() => null);
+  const storedTerms = normalizeKeywordTerms(stored?.terms || []);
+  const usingFallbackTopics = storedTerms.length === 0;
+  const terms = usingFallbackTopics ? DEFAULT_TOPIC_TERMS : storedTerms;
+
+  return {
+    terms,
+    topics: buildTopicsFromTerms(terms),
+    usingFallbackTopics,
+    updatedAt: usingFallbackTopics ? '' : cleanText(stored?.updatedAt || ''),
+    updatedBy: usingFallbackTopics ? '' : cleanText(stored?.updatedBy || ''),
+  };
+}
+
+async function saveKeywordTerms(env, terms, updatedBy) {
+  const normalizedTerms = normalizeKeywordTerms(terms);
+  if (normalizedTerms.length === 0) {
+    throw new Error('At least one keyword is required');
+  }
+
+  await env.MEDBOT_KV.put(
+    KEYWORDS_CONFIG_KEY,
+    JSON.stringify({
+      version: 1,
+      terms: normalizedTerms,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+    })
+  );
+}
+
+function buildTopicsFromTerms(terms) {
+  return terms.map((term) => {
+    const normalizedTerm = cleanKeywordTerm(term);
+    const quotedTerm = quoteTopicTerm(normalizedTerm);
+
+    return {
+      term: normalizedTerm,
+      label: formatTopicLabel(normalizedTerm),
+      query: `(${quotedTerm}[Title/Abstract] OR ${quotedTerm}[MeSH Terms])`,
+      broadQuery: quotedTerm,
+      tokens: [normalizedTerm],
+    };
+  });
+}
+
+function parseKeywordTermsInput(input) {
+  return normalizeKeywordTerms(input.split(/[\n,;]+/));
+}
+
+function normalizeKeywordTerms(terms) {
+  const normalized = [];
+
+  for (const term of Array.isArray(terms) ? terms : []) {
+    const cleaned = cleanKeywordTerm(term);
+    if (!cleaned) {
+      continue;
+    }
+    if (normalized.some((existing) => existing.toLowerCase() === cleaned.toLowerCase())) {
+      continue;
+    }
+    normalized.push(cleaned);
+    if (normalized.length >= MAX_KEYWORD_TERMS) {
+      break;
+    }
+  }
+
+  return normalized;
+}
+
+function cleanKeywordTerm(value) {
+  return cleanText(String(value || '').replace(/["']/g, ''));
+}
+
+function quoteTopicTerm(term) {
+  return `"${term.replace(/\\/g, '\\\\')}"`;
+}
+
+function formatTopicLabel(term) {
+  return term
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
 function formatAuthors(authors) {
@@ -1251,6 +1515,25 @@ function chunkArray(items, size) {
 
 function uniqueStrings(values) {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function buildTopicSignature(topics) {
+  const source = JSON.stringify(
+    topics.map((topic) => ({
+      label: cleanText(topic.label),
+      query: cleanText(topic.query),
+      broadQuery: cleanText(topic.broadQuery),
+      tokens: uniqueStrings(Array.isArray(topic.tokens) ? topic.tokens.map((token) => cleanText(token)) : []),
+    }))
+  );
+
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return `t${(hash >>> 0).toString(36)}`;
 }
 
 function stringifyParams(params) {
