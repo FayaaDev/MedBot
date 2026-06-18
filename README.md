@@ -35,7 +35,7 @@ Example value:
 ```json
 {
   "version": 1,
-  "terms": ["malaria", "dengue"],
+  "terms": ["dengue, vaccine", "malaria, treatment"],
   "updatedAt": "2026-06-15T09:00:00.000Z",
   "updatedBy": "telegram:<chatId>"
 }
@@ -91,11 +91,9 @@ npm run deploy
 
 - `/ping`: replies with `pong`
 - `/start`: triggers a manual digest run in the configured `TELEGRAM_CHAT_ID`
-- `/keywords`: shows the active keywords, topic signature, and whether they came from KV or fallback defaults
-- `/setkeywords malaria, dengue`: replaces the active keyword list in Workers KV
-- `Change keyword`: shows the active keywords and the `/setkeywords` usage
+- `keyword`: shows the active keywords, then asks whether to replace them
 
-The bot includes a reply keyboard with `/start`, `/ping`, and `Change keyword` buttons on its chat responses.
+The bot includes a reply keyboard with `/start`, `/ping`, and `Keyword` buttons on its chat responses.
 
 To enable the chat command, point your Telegram bot webhook at:
 
@@ -105,15 +103,15 @@ https://<your-worker-domain>/telegram/webhook
 
 If you set `TELEGRAM_WEBHOOK_SECRET`, configure the Telegram webhook with the same secret token.
 
-The bot accepts Telegram commands from any chat. `/ping`, `/keywords`, and `Change keyword` reply in the caller's chat; `/start` triggers digest delivery to the configured `TELEGRAM_CHAT_ID`.
+The bot accepts Telegram commands from any chat. `/ping` and `keyword` reply in the caller's chat; `/start` triggers digest delivery to the configured `TELEGRAM_CHAT_ID`.
 
-`/setkeywords` is restricted to the configured `TELEGRAM_CHAT_ID` and replaces the full active keyword list. Example:
+When you send `keyword`, the bot shows the current keyword list and asks for a `yes` or `no` reply. If you reply `yes` from the configured `TELEGRAM_CHAT_ID`, the bot asks for the replacement queries. Commas mean `AND` inside one query. Use semicolons or new lines to set multiple queries. Example:
 
 ```text
-/setkeywords malaria, dengue, tuberculosis
+dengue, vaccine; malaria, treatment
 ```
 
-These responses include reply keyboard buttons for `/start`, `/ping`, and `Change keyword`.
+These responses include reply keyboard buttons for `/start`, `/ping`, and `Keyword`.
 
 ## Notes
 

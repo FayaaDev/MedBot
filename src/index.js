@@ -9,6 +9,8 @@ const DEFAULT_SECONDARY_RETMAX = 8;
 const DEFAULT_WOS_RETMAX = 10;
 const WOS_FREE_PLAN_SPACING_MS = 1100;
 const KEYWORDS_CONFIG_KEY = 'config:keywords';
+const KEYWORD_FLOW_STATE_PREFIX = 'telegram:keyword-flow:';
+const KEYWORD_FLOW_TTL_SECONDS = 10 * 60;
 const MAX_KEYWORD_TERMS = 10;
 
 const DEFAULT_TOPIC_TERMS = ['malaria', 'plasmodium'];
@@ -161,32 +163,15 @@ async function handleTelegramWebhook(request, env) {
     return jsonResponse({ ok: true, handled: '/start', result });
   }
 
-  if (command === '/keywords') {
-    const telegram = createTelegramClient(env);
-    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
-    const response = await telegram.sendMessage(String(chatId), formatKeywordStatus(config), {
-      reply_parameters: {
-        message_id: message.message_id,
-      },
-      reply_markup: telegramReplyKeyboard(),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
-    }
-
-    return jsonResponse({ ok: true, handled: '/keywords' });
-  }
-
-  if (command === '/changekeyword' || normalizedText === 'change keyword') {
+  if (command === '/keyword' || command === '/keywords' || command === '/changekeyword' || normalizedText === 'keyword') {
     const telegram = createTelegramClient(env);
     const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
     const response = await telegram.sendMessage(
       String(chatId),
       [
         formatKeywordStatus(config),
-        'To replace all active keywords, send:',
-        '/setkeywords malaria, dengue',
+        'Do you want to clear the current keywords and set new ones?',
+        'Reply yes or no.',
       ].join('\n'),
       {
         reply_parameters: {
@@ -200,32 +185,117 @@ async function handleTelegramWebhook(request, env) {
       throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
     }
 
-    return jsonResponse({ ok: true, handled: '/changekeyword' });
+    await setKeywordFlowState(env, chatId, { step: 'confirm' });
+    return jsonResponse({ ok: true, handled: '/keyword' });
   }
 
-  if (command === '/setkeywords') {
+  const keywordFlowState = await getKeywordFlowState(env, chatId);
+  if (keywordFlowState?.step === 'confirm') {
     const telegram = createTelegramClient(env);
-    const configuredChatId = cleanText(env.TELEGRAM_CHAT_ID || '');
-    if (!configuredChatId || String(chatId) !== configuredChatId) {
-      const denied = await telegram.sendMessage(String(chatId), 'Keyword changes are restricted to the configured delivery chat.', {
+    if (normalizedText === 'no' || normalizedText === 'n') {
+      await clearKeywordFlowState(env, chatId);
+      const cancelled = await telegram.sendMessage(String(chatId), 'Kept the current keywords.', {
         reply_parameters: {
           message_id: message.message_id,
         },
         reply_markup: telegramReplyKeyboard(),
       });
 
-      if (!denied.ok) {
-        throw new Error(`Telegram send failed: ${denied.description || 'unknown error'}`);
+      if (!cancelled.ok) {
+        throw new Error(`Telegram send failed: ${cancelled.description || 'unknown error'}`);
       }
 
-      return jsonResponse({ ok: true, handled: '/setkeywords', authorized: false });
+      return jsonResponse({ ok: true, handled: 'keyword:confirm', updated: false });
     }
 
-    const requestedTerms = parseKeywordTermsInput(text.slice(command.length).trim());
+    if (normalizedText === 'yes' || normalizedText === 'y') {
+      const configuredChatId = cleanText(env.TELEGRAM_CHAT_ID || '');
+      if (!configuredChatId || String(chatId) !== configuredChatId) {
+        await clearKeywordFlowState(env, chatId);
+        const denied = await telegram.sendMessage(String(chatId), 'Keyword changes are restricted to the configured delivery chat.', {
+          reply_parameters: {
+            message_id: message.message_id,
+          },
+          reply_markup: telegramReplyKeyboard(),
+        });
+
+        if (!denied.ok) {
+          throw new Error(`Telegram send failed: ${denied.description || 'unknown error'}`);
+        }
+
+        return jsonResponse({ ok: true, handled: 'keyword:confirm', authorized: false });
+      }
+
+      await setKeywordFlowState(env, chatId, { step: 'awaiting_terms' });
+      const prompt = await telegram.sendMessage(
+        String(chatId),
+        [
+          'Send the new keywords.',
+          'Commas mean AND inside one query.',
+          'Use semicolons or new lines for multiple queries.',
+          'Example: dengue, vaccine; malaria, treatment',
+        ].join('\n'),
+        {
+          reply_parameters: {
+            message_id: message.message_id,
+          },
+          reply_markup: telegramReplyKeyboard(),
+        }
+      );
+
+      if (!prompt.ok) {
+        throw new Error(`Telegram send failed: ${prompt.description || 'unknown error'}`);
+      }
+
+      return jsonResponse({ ok: true, handled: 'keyword:confirm', awaiting: true });
+    }
+
+    const retry = await telegram.sendMessage(String(chatId), 'Reply yes to replace the keywords or no to keep them.', {
+      reply_parameters: {
+        message_id: message.message_id,
+      },
+      reply_markup: telegramReplyKeyboard(),
+    });
+
+    if (!retry.ok) {
+      throw new Error(`Telegram send failed: ${retry.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: 'keyword:confirm', updated: false });
+  }
+
+  if (keywordFlowState?.step === 'awaiting_terms') {
+    const telegram = createTelegramClient(env);
+    if (normalizedText === 'no' || normalizedText === 'cancel') {
+      await clearKeywordFlowState(env, chatId);
+      const cancelled = await telegram.sendMessage(String(chatId), 'Keyword update cancelled.', {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+        reply_markup: telegramReplyKeyboard(),
+      });
+
+      if (!cancelled.ok) {
+        throw new Error(`Telegram send failed: ${cancelled.description || 'unknown error'}`);
+      }
+
+      return jsonResponse({ ok: true, handled: 'keyword:update', updated: false });
+    }
+
+    if (text.startsWith('/')) {
+      return jsonResponse({ ok: true, ignored: true, command, pending: 'keyword:update' });
+    }
+
+    const requestedTerms = parseKeywordTermsInput(text.trim());
     if (requestedTerms.length === 0) {
       const usage = await telegram.sendMessage(
         String(chatId),
-        ['Usage:', '/setkeywords malaria, dengue', `You can set up to ${MAX_KEYWORD_TERMS} keywords.`].join('\n'),
+        [
+          'Send at least one query.',
+          'Commas mean AND inside one query.',
+          'Use semicolons or new lines for multiple queries.',
+          'Example: dengue, vaccine; malaria, treatment',
+        ].join('\n'),
         {
           reply_parameters: {
             message_id: message.message_id,
@@ -238,10 +308,11 @@ async function handleTelegramWebhook(request, env) {
         throw new Error(`Telegram send failed: ${usage.description || 'unknown error'}`);
       }
 
-      return jsonResponse({ ok: true, handled: '/setkeywords', updated: false });
+      return jsonResponse({ ok: true, handled: 'keyword:update', updated: false });
     }
 
     await saveKeywordTerms(env, requestedTerms, `telegram:${chatId}`);
+    await clearKeywordFlowState(env, chatId);
     const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
     const updated = await telegram.sendMessage(
       String(chatId),
@@ -258,7 +329,28 @@ async function handleTelegramWebhook(request, env) {
       throw new Error(`Telegram send failed: ${updated.description || 'unknown error'}`);
     }
 
-    return jsonResponse({ ok: true, handled: '/setkeywords', updated: true, topics: config.topicLabels });
+    return jsonResponse({ ok: true, handled: 'keyword:update', updated: true, topics: config.topicLabels });
+  }
+
+  if (command === '/setkeywords') {
+    const telegram = createTelegramClient(env);
+    const migrated = await telegram.sendMessage(
+      String(chatId),
+      ['Use `keyword` instead.', 'It will show the current keywords and guide you through updating them.'].join('\n'),
+      {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+        reply_markup: telegramReplyKeyboard(),
+        parse_mode: 'Markdown',
+      }
+    );
+
+    if (!migrated.ok) {
+      throw new Error(`Telegram send failed: ${migrated.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: '/setkeywords', migrated: true });
   }
 
   return jsonResponse({ ok: true, ignored: true, command });
@@ -837,7 +929,7 @@ function createTelegramClient(env) {
 
 function telegramReplyKeyboard() {
   return {
-    keyboard: [[{ text: '/start' }, { text: '/ping' }], [{ text: 'Change keyword' }]],
+    keyboard: [[{ text: '/start' }, { text: '/ping' }], [{ text: 'Keyword' }]],
     resize_keyboard: true,
   };
 }
@@ -1232,23 +1324,46 @@ async function saveKeywordTerms(env, terms, updatedBy) {
   );
 }
 
+async function getKeywordFlowState(env, chatId) {
+  return env.MEDBOT_KV.get(keywordFlowStateKey(chatId), 'json').catch(() => null);
+}
+
+async function setKeywordFlowState(env, chatId, state) {
+  await env.MEDBOT_KV.put(keywordFlowStateKey(chatId), JSON.stringify(state), {
+    expirationTtl: KEYWORD_FLOW_TTL_SECONDS,
+  });
+}
+
+async function clearKeywordFlowState(env, chatId) {
+  await env.MEDBOT_KV.delete(keywordFlowStateKey(chatId));
+}
+
+function keywordFlowStateKey(chatId) {
+  return `${KEYWORD_FLOW_STATE_PREFIX}${chatId}`;
+}
+
 function buildTopicsFromTerms(terms) {
   return terms.map((term) => {
     const normalizedTerm = cleanKeywordTerm(term);
-    const quotedTerm = quoteTopicTerm(normalizedTerm);
+    const tokens = splitKeywordComponents(normalizedTerm);
+    const componentQueries = tokens.map((token) => {
+      const quotedToken = quoteTopicTerm(token);
+      return `(${quotedToken}[Title/Abstract] OR ${quotedToken}[MeSH Terms])`;
+    });
+    const broadQuery = tokens.map((token) => quoteTopicTerm(token)).join(' AND ');
 
     return {
       term: normalizedTerm,
-      label: formatTopicLabel(normalizedTerm),
-      query: `(${quotedTerm}[Title/Abstract] OR ${quotedTerm}[MeSH Terms])`,
-      broadQuery: quotedTerm,
-      tokens: [normalizedTerm],
+      label: formatTopicLabel(tokens),
+      query: componentQueries.join(' AND '),
+      broadQuery,
+      tokens,
     };
   });
 }
 
 function parseKeywordTermsInput(input) {
-  return normalizeKeywordTerms(input.split(/[\n,;]+/));
+  return normalizeKeywordTerms(input.split(/[\n;]+/));
 }
 
 function normalizeKeywordTerms(terms) {
@@ -1272,19 +1387,38 @@ function normalizeKeywordTerms(terms) {
 }
 
 function cleanKeywordTerm(value) {
-  return cleanText(String(value || '').replace(/["']/g, ''));
+  return cleanText(
+    String(value || '')
+      .replace(/["']/g, '')
+      .split(',')
+      .map((part) => cleanText(part))
+      .filter(Boolean)
+      .join(', ')
+  );
+}
+
+function splitKeywordComponents(term) {
+  return term
+    .split(',')
+    .map((part) => cleanText(part))
+    .filter(Boolean);
 }
 
 function quoteTopicTerm(term) {
   return `"${term.replace(/\\/g, '\\\\')}"`;
 }
 
-function formatTopicLabel(term) {
-  return term
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
+function formatTopicLabel(termOrTokens) {
+  const tokens = Array.isArray(termOrTokens) ? termOrTokens : splitKeywordComponents(termOrTokens);
+  return tokens
+    .map((token) =>
+      token
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ')
+    )
+    .join(' and ');
 }
 
 function formatAuthors(authors) {
