@@ -5,13 +5,19 @@ const SENT_TTL_SECONDS = 366 * 24 * 60 * 60;
 const TELEGRAM_MESSAGE_LIMIT = 3900;
 const DIGEST_STORAGE_PRETTY_TTL = 366 * 24 * 60 * 60;
 const DEFAULT_PRIMARY_RETMAX = 25;
+const DEFAULT_SECONDARY_RETMAX = 8;
 const DEFAULT_WOS_RETMAX = 10;
 const WOS_FREE_PLAN_SPACING_MS = 1100;
-const MAX_USER_TOPICS = 5;
-const MAX_KEYWORDS_LENGTH = 500;
-const USER_PREFIX = 'user:';
-const USER_DIGEST_PREFIX = 'digest:';
-const USER_LAST_PREFIX = 'last:';
+const KEYWORDS_CONFIG_KEY = 'config:keywords';
+const KEYWORD_FLOW_STATE_PREFIX = 'telegram:keyword-flow:';
+const KEYWORD_FLOW_TTL_SECONDS = 10 * 60;
+const MAX_KEYWORD_TERMS = 10;
+const USER_KEY_PREFIX = 'user:';
+const USERS_INDEX_KEY = 'users:index';
+const SAUDI_TIME_ZONE = 'Asia/Riyadh';
+
+const DEFAULT_TOPIC_TERMS = ['malaria', 'plasmodium'];
+
 const PRIMARY_DATABASES = ['pubmed', 'pmc'];
 
 const HIGH_EVIDENCE_RULES = [
@@ -50,12 +56,13 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(handleScheduled(env));
+    ctx.waitUntil(runScheduledDigests(env));
   },
 };
 
 async function handleFetch(request, env) {
   const url = new URL(request.url);
+  const targetChatId = cleanText(url.searchParams.get('chatId') || '');
 
   if (url.pathname === '/telegram/webhook' && request.method === 'POST') {
     return handleTelegramWebhook(request, env);
@@ -71,57 +78,37 @@ async function handleFetch(request, env) {
   }
 
   if (url.pathname === '/health') {
+    const lastRun = await env.MEDBOT_KV.get('run:last', 'json');
+    const config = await loadRuntimeConfig(env, { requireDeliverySecrets: false });
     return jsonResponse({
       ok: true,
       service: 'medbot',
+      topics: config.topicLabels,
+      topicSignature: config.topicSignature,
       primaryDatabases: PRIMARY_DATABASES,
       externalSources: ['entrez', 'wos'],
-      scheduleUtc: '0 6 * * *',
-      subscriptionModel: 'per-user',
-      commands: ['/start', '/run', '/changekeyword', '/stop'],
-      config: getPublicConfigFromEnv(env),
-      lastRun: await env.MEDBOT_KV.get('run:last', 'json'),
+      scheduleUtc: '* * * * *',
+      usingFallbackTopics: config.usingFallbackTopics,
+      config: publicConfig(config),
+      lastRun,
     });
   }
 
-  if (url.pathname === '/preview' && request.method === 'POST') {
+  if (url.pathname === '/preview') {
     ensureAuthorized(request, env);
-    const payload = await readJsonBody(request);
-    const { subscription, topics, keywordsRaw } = await resolveDigestTarget(env, payload, { requireChatId: false });
-    const result = await runDigest(env, {
-      reason: 'preview',
-      deliver: false,
-      subscription,
-      topics,
-      keywordsRaw,
-      persist: false,
-    });
+    const result = await runDigest(env, { reason: 'preview', deliver: false, chatId: targetChatId });
     return jsonResponse({ ok: true, mode: 'preview', result });
   }
 
-  if (url.pathname === '/run' && request.method === 'POST') {
+  if (url.pathname === '/run') {
     ensureAuthorized(request, env);
-    const payload = await readJsonBody(request);
-    const { subscription } = await resolveDigestTarget(env, payload, { requireChatId: true });
-    const result = await runDigest(env, {
-      reason: 'manual',
-      deliver: true,
-      subscription,
-      persist: true,
-      storeGlobalLast: true,
-    });
+    const result = await runDigest(env, { reason: 'manual', deliver: true, chatId: targetChatId });
     return jsonResponse({ ok: true, mode: 'run', result });
   }
 
   if (url.pathname === '/last') {
     ensureAuthorized(request, env);
-    const chatId = cleanText(url.searchParams.get('chatId') || '');
-    if (!chatId) {
-      const lastRun = await env.MEDBOT_KV.get('run:last', 'json');
-      return jsonResponse({ ok: true, digest: lastRun });
-    }
-
-    const lastDigest = await env.MEDBOT_KV.get(lastDigestPointerKey(chatId), 'json');
+    const lastDigest = await env.MEDBOT_KV.get(lastRunStorageKey(targetChatId), 'json');
     if (!lastDigest?.digestKey) {
       return jsonResponse({ ok: true, digest: null });
     }
@@ -133,60 +120,17 @@ async function handleFetch(request, env) {
   return jsonResponse({ ok: false, error: 'Not found' }, 404);
 }
 
-async function handleScheduled(env) {
-  const subscriptions = await listSubscriptions(env);
-  const activeSubscriptions = subscriptions.filter((subscription) => subscription.active && subscription.topics.length > 0);
-  const digestDate = new Date().toISOString().slice(0, 10);
-  const results = [];
-
-  for (const subscription of activeSubscriptions) {
-    if (subscription.lastSentDate === digestDate) {
-      continue;
-    }
-
-    try {
-      const result = await runDigest(env, {
-        reason: 'scheduled',
-        deliver: true,
-        subscription,
-        persist: true,
-      });
-      await saveSubscription(env, {
-        ...subscription,
-        lastSentDate: digestDate,
-        updatedAt: new Date().toISOString(),
-      });
-      results.push({ chatId: subscription.chatId, ok: true, sentMessages: result.sentMessages });
-    } catch (error) {
-      await recordError(env, error);
-      console.error(JSON.stringify({ event: 'scheduled_user_failure', chatId: subscription.chatId, error: error.message }));
-      results.push({ chatId: subscription.chatId, ok: false, error: error.message });
-    }
-  }
-
-  const summary = {
-    ok: true,
-    reason: 'scheduled',
-    completedAt: new Date().toISOString(),
-    processedUsers: results.length,
-    deliveredUsers: results.filter((result) => result.ok).length,
-    failedUsers: results.filter((result) => !result.ok).length,
-    results,
-  };
-
-  await env.MEDBOT_KV.put('run:last', JSON.stringify(summary), {
-    expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
-  });
-
-  return summary;
-}
-
 async function handleTelegramWebhook(request, env) {
   validateTelegramWebhook(request, env);
 
   const update = await request.json().catch(() => null);
+  if (update?.callback_query) {
+    await handleTelegramCallbackQuery(update.callback_query, env);
+    return jsonResponse({ ok: true, handled: 'callback_query' });
+  }
+
   const message = update?.message;
-  const chatId = message?.chat?.id;
+  const chatId = cleanText(message?.chat?.id || '');
   const text = String(message?.text || '').trim();
 
   if (!chatId || !text) {
@@ -194,250 +138,349 @@ async function handleTelegramWebhook(request, env) {
   }
 
   const telegram = createTelegramClient(env);
-  const subscription = (await getSubscription(env, chatId)) || createSubscription(chatId);
-  const command = text.startsWith('/') ? text.split(/\s+/)[0].split('@')[0].toLowerCase() : '';
-  const args = command ? text.slice(command.length).trim() : '';
+  const command = text.split(/\s+/)[0].split('@')[0].toLowerCase();
+  const normalizedText = text.toLowerCase();
+  const isAdmin = isAdminChat(env, chatId);
+
+  let user = await getUserProfile(env, chatId);
+  if (user) {
+    user = await upsertUserProfile(env, buildTelegramProfile(message.from, chatId), { status: user.status });
+  }
+
+  const flowState = await getKeywordFlowState(env, chatId);
+
+  if (command === '/ping') {
+    const response = await telegram.sendMessage(String(chatId), 'pong', {
+      reply_parameters: {
+        message_id: message.message_id,
+      },
+      reply_markup: approvedReplyKeyboard(isAdmin),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
+    }
+
+    return jsonResponse({ ok: true, handled: '/ping' });
+  }
+
+  if (command === '/join') {
+    const profile = await upsertUserProfile(env, buildTelegramProfile(message.from, chatId), {
+      status: user?.status === 'approved' ? 'approved' : 'pending',
+    });
+
+    if (profile.status === 'approved') {
+      const approved = await telegram.sendMessage(
+        chatId,
+        ['You are already approved.', await formatUserSettings(env, chatId)].join('\n\n'),
+        {
+          reply_parameters: {
+            message_id: message.message_id,
+          },
+          reply_markup: approvedReplyKeyboard(isAdmin),
+        }
+      );
+
+      if (!approved.ok) {
+        throw new Error(`Telegram send failed: ${approved.description || 'unknown error'}`);
+      }
+
+      return jsonResponse({ ok: true, handled: '/join', status: 'approved' });
+    }
+
+    const joinResponse = await telegram.sendMessage(
+      chatId,
+      profile.status === 'rejected'
+        ? 'Your access request was already rejected. An admin can still approve you later.'
+        : 'Your access request has been sent. Wait for admin approval.',
+      {
+        reply_parameters: {
+          message_id: message.message_id,
+        },
+      }
+    );
+
+    if (!joinResponse.ok) {
+      throw new Error(`Telegram send failed: ${joinResponse.description || 'unknown error'}`);
+    }
+
+    if (!isAdmin) {
+      await notifyAdminAboutJoinRequest(env, profile);
+    }
+
+    return jsonResponse({ ok: true, handled: '/join', status: profile.status });
+  }
+
+  if (flowState?.step === 'confirm_keywords') {
+    if (normalizedText === 'no' || normalizedText === 'n') {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, 'Kept the current keywords.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'keyword:confirm', updated: false });
+    }
+
+    if (normalizedText === 'yes' || normalizedText === 'y') {
+      await setKeywordFlowState(env, chatId, { step: 'awaiting_terms' });
+      await sendTelegramOrThrow(
+        telegram,
+        chatId,
+        ['Send the new keywords.', 'Commas mean AND inside one query.', 'Use semicolons or new lines for multiple queries.', 'Example: dengue, vaccine; malaria, treatment'].join('\n'),
+        message.message_id,
+        approvedReplyKeyboard(isAdmin)
+      );
+      return jsonResponse({ ok: true, handled: 'keyword:confirm', awaiting: true });
+    }
+
+    await sendTelegramOrThrow(telegram, chatId, 'Reply yes to replace the keywords or no to keep them.', message.message_id, approvedReplyKeyboard(isAdmin));
+    return jsonResponse({ ok: true, handled: 'keyword:confirm', updated: false });
+  }
+
+  if (flowState?.step === 'awaiting_terms') {
+    if (normalizedText === 'cancel') {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, 'Keyword update cancelled.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'keyword:update', updated: false });
+    }
+
+    if (text.startsWith('/')) {
+      return jsonResponse({ ok: true, ignored: true, command, pending: 'keyword:update' });
+    }
+
+    const requestedTerms = parseKeywordTermsInput(text.trim());
+    if (requestedTerms.length === 0) {
+      await sendTelegramOrThrow(
+        telegram,
+        chatId,
+        ['Send at least one query.', 'Commas mean AND inside one query.', 'Use semicolons or new lines for multiple queries.', 'Example: dengue, vaccine; malaria, treatment'].join('\n'),
+        message.message_id,
+        approvedReplyKeyboard(isAdmin)
+      );
+      return jsonResponse({ ok: true, handled: 'keyword:update', updated: false });
+    }
+
+    await saveUserKeywordTerms(env, chatId, requestedTerms, `telegram:${chatId}`);
+    await setKeywordFlowState(env, chatId, { step: 'awaiting_schedule' });
+    const config = await loadUserRuntimeConfig(env, chatId);
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      ['Updated your keywords.', formatKeywordStatus(config), 'Now send your daily schedule in Saudi time as HH:MM.', 'Example: 09:30'].join('\n\n'),
+      message.message_id,
+      approvedReplyKeyboard(isAdmin)
+    );
+    return jsonResponse({ ok: true, handled: 'keyword:update', updated: true, topics: config.topicLabels });
+  }
+
+  if (flowState?.step === 'awaiting_schedule') {
+    if (normalizedText === 'cancel') {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, 'Schedule update cancelled.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'schedule:update', updated: false });
+    }
+
+    if (text.startsWith('/')) {
+      return jsonResponse({ ok: true, ignored: true, command, pending: 'schedule:update' });
+    }
+
+    const scheduleTime = normalizeScheduleTime(text);
+    if (!scheduleTime) {
+      await sendTelegramOrThrow(
+        telegram,
+        chatId,
+        'Send the daily schedule as HH:MM in Saudi time. Example: 09:30',
+        message.message_id,
+        approvedReplyKeyboard(isAdmin)
+      );
+      return jsonResponse({ ok: true, handled: 'schedule:update', updated: false });
+    }
+
+    await saveUserSchedule(env, chatId, scheduleTime);
+    await clearKeywordFlowState(env, chatId);
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      ['Updated your schedule.', await formatUserSettings(env, chatId)].join('\n\n'),
+      message.message_id,
+      approvedReplyKeyboard(isAdmin)
+    );
+    return jsonResponse({ ok: true, handled: 'schedule:update', updated: true, time: scheduleTime });
+  }
+
+  if (user?.status !== 'approved' && !isAdmin) {
+    await sendTelegramOrThrow(telegram, chatId, accessStatusMessage(user), message.message_id);
+    return jsonResponse({ ok: true, handled: 'access:gate', status: user?.status || 'new' });
+  }
+
+  if (command === '/keywords' || command === '/keyword' || normalizedText === 'keywords') {
+    const config = await loadUserRuntimeConfig(env, chatId);
+    await setKeywordFlowState(env, chatId, { step: 'confirm_keywords' });
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      [formatKeywordStatus(config), 'Do you want to clear the current keywords and set new ones?', 'Reply yes or no.'].join('\n'),
+      message.message_id,
+      approvedReplyKeyboard(isAdmin)
+    );
+    return jsonResponse({ ok: true, handled: '/keywords' });
+  }
+
+  if (command === '/schedule' || normalizedText === 'schedule') {
+    const schedule = await getUserSchedule(env, chatId);
+    await setKeywordFlowState(env, chatId, { step: 'awaiting_schedule' });
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      [
+        schedule?.time ? `Current schedule: ${schedule.time} (${SAUDI_TIME_ZONE})` : 'No schedule set yet.',
+        'Send your daily schedule in Saudi time as HH:MM.',
+        'Example: 09:30',
+      ].join('\n'),
+      message.message_id,
+      approvedReplyKeyboard(isAdmin)
+    );
+    return jsonResponse({ ok: true, handled: '/schedule' });
+  }
+
+  if (command === '/settings' || command === '/mysettings' || normalizedText === 'my settings') {
+    await sendTelegramOrThrow(telegram, chatId, await formatUserSettings(env, chatId), message.message_id, approvedReplyKeyboard(isAdmin));
+    return jsonResponse({ ok: true, handled: '/settings' });
+  }
+
+  if (command === '/runnow' || normalizedText === 'run now') {
+    await sendTelegramOrThrow(telegram, chatId, 'Fetching articles now...', message.message_id, approvedReplyKeyboard(isAdmin));
+    const result = await runDigest(env, { reason: 'telegram-manual', deliver: true, chatId });
+    return jsonResponse({ ok: true, handled: '/runnow', result });
+  }
+
+  if (isAdmin && (command === '/users' || normalizedText === 'users')) {
+    const usersMessage = await buildUsersAdminMessage(env, 'all');
+    await sendTelegramOrThrow(telegram, chatId, usersMessage.text, message.message_id, usersMessage.reply_markup);
+    return jsonResponse({ ok: true, handled: '/users' });
+  }
+
+  if (isAdmin && (command === '/pending' || normalizedText === 'pending')) {
+    const pendingMessage = await buildUsersAdminMessage(env, 'pending');
+    await sendTelegramOrThrow(telegram, chatId, pendingMessage.text, message.message_id, pendingMessage.reply_markup);
+    return jsonResponse({ ok: true, handled: '/pending' });
+  }
+
+  if (command === '/setkeywords') {
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      ['Use `Keywords` instead.', 'It will show the current keywords and guide you through updating them.'].join('\n'),
+      message.message_id,
+      approvedReplyKeyboard(isAdmin),
+      'Markdown'
+    );
+    return jsonResponse({ ok: true, handled: '/setkeywords', migrated: true });
+  }
 
   if (command === '/start') {
-    const nextSubscription = subscription.topics.length
-      ? {
-          ...subscription,
-          active: true,
-          state: 'ready',
-          updatedAt: new Date().toISOString(),
-        }
-      : {
-          ...subscription,
-          active: true,
-          state: 'awaiting_keywords',
-          updatedAt: new Date().toISOString(),
-        };
-    await saveSubscription(env, nextSubscription);
-
-    const messageText = subscription.topics.length
-      ? [
-          'Welcome to MedBot.',
-          `Current keywords: ${formatTopicList(subscription.topics)}.`,
-          'Use /changekeyword to update them.',
-          'Reports are sent daily at 09:00 GMT+3.',
-        ].join('\n')
-      : [
-          'Welcome to MedBot.',
-          'Send your keywords as comma-separated topics or as one free-text research query.',
-          'Example: diabetes, hypertension, GLP-1',
-          'Reports are sent daily at 09:00 GMT+3.',
-        ].join('\n');
-
-    await sendTelegramText(telegram, chatId, messageText, message?.message_id);
-    return jsonResponse({ ok: true, handled: '/start' });
+    await sendTelegramOrThrow(telegram, chatId, 'Use /join to request access.', message.message_id);
+    return jsonResponse({ ok: true, handled: '/start', migrated: true });
   }
 
-  if (command === '/changekeyword') {
-    if (!args) {
-      await saveSubscription(env, {
-        ...subscription,
-        active: true,
-        state: 'awaiting_keywords',
-        updatedAt: new Date().toISOString(),
-      });
-      await sendTelegramText(
-        telegram,
-        chatId,
-        'Send your new keywords as comma-separated topics or one free-text research query.',
-        message?.message_id
-      );
-      return jsonResponse({ ok: true, handled: '/changekeyword' });
-    }
-
-    let updatedSubscription;
-    try {
-      updatedSubscription = await updateSubscriptionKeywords(env, subscription, args);
-    } catch (error) {
-      await sendTelegramText(telegram, chatId, error.message, message?.message_id);
-      return jsonResponse({ ok: true, handled: '/changekeyword', error: error.message });
-    }
-    await sendTelegramText(
-      telegram,
-      chatId,
-      [`Keywords saved.`, `Current keywords: ${formatTopicList(updatedSubscription.topics)}.`, 'Reports are sent daily at 09:00 GMT+3.'].join('\n'),
-      message?.message_id
-    );
-    return jsonResponse({ ok: true, handled: '/changekeyword' });
-  }
-
-  if (command === '/stop') {
-    await saveSubscription(env, {
-      ...subscription,
-      active: false,
-      state: 'ready',
-      updatedAt: new Date().toISOString(),
-    });
-    await sendTelegramText(telegram, chatId, 'Your subscription is paused. Use /start when you want reports again.', message?.message_id);
-    return jsonResponse({ ok: true, handled: '/stop' });
-  }
-
-  if (command === '/run') {
-    if (!subscription.topics.length) {
-      await sendTelegramText(
-        telegram,
-        chatId,
-        'No keywords are saved yet. Use /start or /changekeyword first.',
-        message?.message_id
-      );
-      return jsonResponse({ ok: true, handled: '/run', error: 'missing_keywords' });
-    }
-
-    if (!subscription.active) {
-      await sendTelegramText(
-        telegram,
-        chatId,
-        'Your subscription is paused. Use /start first, then run the report again.',
-        message?.message_id
-      );
-      return jsonResponse({ ok: true, handled: '/run', error: 'subscription_inactive' });
-    }
-
-    await sendTelegramText(telegram, chatId, 'Generating report now...', message?.message_id);
-    const result = await runDigest(env, {
-      reason: 'telegram_run',
-      deliver: true,
-      subscription,
-      persist: true,
-    });
-    return jsonResponse({ ok: true, handled: '/run', result });
-  }
-
-  if (command) {
-    await sendTelegramText(telegram, chatId, buildHelpMessage(), message?.message_id);
-    return jsonResponse({ ok: true, ignored: true, command });
-  }
-
-  if (subscription.state === 'awaiting_keywords') {
-    let updatedSubscription;
-    try {
-      updatedSubscription = await updateSubscriptionKeywords(env, subscription, text);
-    } catch (error) {
-      await sendTelegramText(telegram, chatId, error.message, message?.message_id);
-      return jsonResponse({ ok: true, handled: 'keywords_reply', error: error.message });
-    }
-    await sendTelegramText(
-      telegram,
-      chatId,
-      [`Keywords saved.`, `Current keywords: ${formatTopicList(updatedSubscription.topics)}.`, 'Reports are sent daily at 09:00 GMT+3.'].join('\n'),
-      message?.message_id
-    );
-    return jsonResponse({ ok: true, handled: 'keywords_reply' });
-  }
-
-  await sendTelegramText(telegram, chatId, buildHelpMessage(), message?.message_id);
-  return jsonResponse({ ok: true, ignored: true });
+  return jsonResponse({ ok: true, ignored: true, command });
 }
 
-async function runDigest(
-  env,
-  { reason, deliver, subscription = null, topics = null, keywordsRaw = '', mode = 'scored', persist = true, storeGlobalLast = false }
-) {
-  const config = getConfig(env);
-  const activeTopics = Array.isArray(topics) && topics.length ? topics : subscription?.topics || [];
-  const sentScope = cleanText(subscription?.chatId || '') || `preview:${truncateText(keywordsRaw || formatTopicList(activeTopics), 40)}`;
-  if (!activeTopics.length) {
-    throw new Error('No keywords configured for this request');
-  }
-
+async function runDigest(env, { reason, deliver, mode = 'scored', chatId = '' }) {
+  const config = chatId
+    ? await loadUserRuntimeConfig(env, chatId)
+    : await loadRuntimeConfig(env, { requireDeliverySecrets: deliver });
   const startedAt = new Date().toISOString();
+  const storageScope = chatId || '';
 
   try {
-    const digest = await buildDigest(env, config, activeTopics, sentScope, mode);
+    const digest = await buildDigest(env, config, mode);
     const messageText = digest.hasContent || config.sendEmptyDigest ? digest.messageText : '';
     let sentMessages = 0;
 
-    if (deliver) {
-      const chatId = cleanText(subscription?.chatId || '');
-      if (!chatId) {
-        throw new Error('Missing chatId for delivery');
-      }
-
-      if (messageText) {
-        const telegram = createTelegramClient(env);
-        sentMessages = await sendTelegramDigest(telegram, chatId, messageText, buildCommandReplyMarkup());
-        await markSent(env, chatId, digest.sentKeys);
-      }
+    if (deliver && messageText) {
+      const telegram = createTelegramClient(env);
+      sentMessages = await sendTelegramDigest(telegram, config.telegramChatId, messageText);
+      await markSent(env, digest.sentKeys);
     }
 
     const digestDate = startedAt.slice(0, 10);
-    const chatId = cleanText(subscription?.chatId || '');
-    const digestKey = chatId ? userDigestKey(chatId, digestDate) : `${USER_DIGEST_PREFIX}preview:${digestDate}`;
+    const digestKey = digestStorageKey(storageScope, config.topicSignature, digestDate);
     const result = {
       ok: true,
       reason,
       deliver,
       mode,
+      chatId: chatId || config.telegramChatId || '',
       startedAt,
       completedAt: new Date().toISOString(),
-      chatId,
       sentMessages,
       sentRecords: deliver && messageText ? digest.sentKeys.length : 0,
       digestKey,
       hasContent: digest.hasContent,
       summary: digest.summary,
-      keywords: keywordsRaw || subscription?.keywordsRaw || formatTopicList(activeTopics),
       messageText: digest.messageText,
       discovery: digest.discovery,
       selectedCounts: digest.selectedCounts,
+      topicSignature: config.topicSignature,
+      topics: config.topicLabels,
     };
 
-    const writes = [];
+    await Promise.all([
+      env.MEDBOT_KV.put(lastRunStorageKey(storageScope), JSON.stringify(result), {
+        expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
+      }),
+      env.MEDBOT_KV.put(digestKey, JSON.stringify(digest.storagePayload), {
+        expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
+      }),
+    ]);
 
-    if (persist && chatId) {
-      writes.push(
-        env.MEDBOT_KV.put(lastDigestPointerKey(chatId), JSON.stringify(result), {
-          expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
-        }),
-        env.MEDBOT_KV.put(
-          digestKey,
-          JSON.stringify({
-            ...digest.storagePayload,
-            chatId,
-            keywords: result.keywords,
-            subscription: publicSubscription(subscription),
-          }),
-          {
-            expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
-          }
-        )
-      );
-    }
-
-    if (persist && storeGlobalLast) {
-      writes.push(
-        env.MEDBOT_KV.put('run:last', JSON.stringify(result), {
-          expirationTtl: DIGEST_STORAGE_PRETTY_TTL,
-        })
-      );
-    }
-
-    if (writes.length) {
-      await Promise.all(writes);
-    }
-
-    console.log(JSON.stringify({ event: 'digest_success', reason, deliver, mode, chatId, selected: digest.selectedCounts }));
+    console.log(JSON.stringify({ event: 'digest_success', reason, deliver, mode, selected: digest.selectedCounts }));
     return result;
   } catch (error) {
     await recordError(env, error);
-    console.error(JSON.stringify({ event: 'digest_failure', reason, mode, chatId: subscription?.chatId || '', error: error.message }));
+    console.error(JSON.stringify({ event: 'digest_failure', reason, mode, error: error.message }));
     throw error;
   }
 }
 
-async function buildDigest(env, config, topics, sentScope, mode = 'scored') {
+async function runScheduledDigests(env) {
+  const userIds = await getUserIndex(env);
+  const now = getTimeZoneNowParts(SAUDI_TIME_ZONE);
+
+  for (const chatId of userIds) {
+    const user = await getUserProfile(env, chatId);
+    if (user?.status !== 'approved') {
+      continue;
+    }
+
+    const schedule = await getUserSchedule(env, chatId);
+    if (!schedule?.enabled || schedule.time !== now.time) {
+      continue;
+    }
+
+    const scheduleSentKey = scheduleLastSentKey(chatId, now.date);
+    if (await env.MEDBOT_KV.get(scheduleSentKey)) {
+      continue;
+    }
+
+    try {
+      await runDigest(env, { reason: 'scheduled', deliver: true, chatId });
+      await env.MEDBOT_KV.put(scheduleSentKey, new Date().toISOString(), {
+        expirationTtl: 3 * 24 * 60 * 60,
+      });
+    } catch (error) {
+      await recordError(env, error);
+    }
+  }
+}
+
+async function buildDigest(env, config, mode = 'scored') {
   const entrez = createEntrezClient(env, config);
   const wos = createWosClient(env, config);
-  const discoveryEntries = await Promise.all(topics.map((topic) => discoverTopic(entrez, wos, topic, config)));
+  const discoveryEntries = await Promise.all(config.topics.map((topic) => discoverTopic(entrez, wos, topic, config)));
   const discovery = Object.fromEntries(discoveryEntries.map((entry) => [entry.topic, entry.counts]));
 
-  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.lookbackDays, topics);
+  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.topics, config.lookbackDays);
   const primaryItems = await enrichPrimaryRecords(entrez, primaryMatches, config);
-  const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config, topics) : [];
+  const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config.topics, config) : [];
   const rankedPrimaryItems = [...primaryItems, ...wosPrimaryItems]
     .map((item) => scorePrimaryItem(item, config))
     .filter((item) => item.title)
@@ -445,9 +488,9 @@ async function buildDigest(env, config, topics, sentScope, mode = 'scored') {
 
   const selection =
     mode === 'all'
-      ? await selectAllMatchingItems(env, rankedPrimaryItems, config, sentScope)
-      : await selectDigestItems(env, rankedPrimaryItems, config, sentScope);
-  const messageText = formatDigest(selection, discovery, config, topics, mode);
+      ? await selectAllMatchingItems(env, rankedPrimaryItems, config)
+      : await selectDigestItems(env, rankedPrimaryItems, config);
+  const messageText = formatDigest(selection, discovery, config, mode);
   const digestDate = new Date().toISOString().slice(0, 10);
 
   return {
@@ -460,8 +503,8 @@ async function buildDigest(env, config, topics, sentScope, mode = 'scored') {
       observational: selection.observational.length,
     },
     sentKeys: [
-      ...selection.highEvidence.map((item) => sentKey(item.db, item.id)),
-      ...selection.observational.map((item) => sentKey(item.db, item.id)),
+      ...selection.highEvidence.map((item) => sentKey(config.deliveryScope, config.topicSignature, item.db, item.id)),
+      ...selection.observational.map((item) => sentKey(config.deliveryScope, config.topicSignature, item.db, item.id)),
     ],
     storagePayload: {
       digestDate,
@@ -469,8 +512,9 @@ async function buildDigest(env, config, topics, sentScope, mode = 'scored') {
       discovery,
       messageText,
       generatedAt: new Date().toISOString(),
+      topicSignature: config.topicSignature,
+      topics: config.topicLabels,
       config: publicConfig(config),
-      topics,
       mode,
     },
   };
@@ -489,16 +533,14 @@ async function discoverTopic(entrez, wos, topic, config) {
       return [db, Number(response?.esearchresult?.count || 0)];
     }),
     wos
-      ? wos
-          .documents({
-            db: config.wosDb,
-            q: buildWosSearchQuery(topic),
-            limit: 1,
-            page: 1,
-            sortField: config.wosSort,
-            publishTimeSpan: buildDateRange(config.lookbackDays),
-          })
-          .then((response) => ['wos', Number(response?.metadata?.total || 0)])
+      ? wos.documents({
+          db: config.wosDb,
+          q: buildWosSearchQuery(topic),
+          limit: 1,
+          page: 1,
+          sortField: config.wosSort,
+          publishTimeSpan: buildDateRange(config.lookbackDays),
+        }).then((response) => ['wos', Number(response?.metadata?.total || 0)])
       : Promise.resolve(['wos', 0]),
   ]);
 
@@ -512,7 +554,7 @@ async function discoverTopic(entrez, wos, topic, config) {
   };
 }
 
-async function collectSearchMatches(entrez, databases, retmax, lookbackDays, topics) {
+async function collectSearchMatches(entrez, databases, retmax, topics, lookbackDays) {
   const merged = new Map();
 
   for (const db of databases) {
@@ -566,7 +608,7 @@ async function enrichPrimaryRecords(entrez, matches) {
   return items;
 }
 
-async function collectWosPrimaryItems(wos, config, topics) {
+async function collectWosPrimaryItems(wos, topics, config) {
   const merged = new Map();
   const publishTimeSpan = buildDateRange(config.lookbackDays);
 
@@ -753,7 +795,7 @@ function scorePrimaryItem(item, config) {
   };
 }
 
-async function selectDigestItems(env, primaryItems, config, chatId) {
+async function selectDigestItems(env, primaryItems, config) {
   const selectedIds = new Set();
   const articleLimit = Math.max(0, config.digestMaxArticles);
   const highEvidenceCandidates = [];
@@ -779,20 +821,29 @@ async function selectDigestItems(env, primaryItems, config, chatId) {
     overflowCandidates.push(item);
   }
 
-  const highEvidence = await pickUnsents(env, chatId, highEvidenceCandidates, config.highEvidenceLimit, selectedIds);
+  const highEvidence = await pickUnsents(
+    env,
+    highEvidenceCandidates,
+    config.highEvidenceLimit,
+    selectedIds,
+    config.deliveryScope,
+    config.topicSignature
+  );
   const observational = await pickUnsents(
     env,
-    chatId,
     observationalCandidates,
     Math.min(config.observationalLimit, Math.max(0, articleLimit - highEvidence.length)),
-    selectedIds
+    selectedIds,
+    config.deliveryScope,
+    config.topicSignature
   );
   const overflow = await pickUnsents(
     env,
-    chatId,
     overflowCandidates,
     Math.max(0, articleLimit - highEvidence.length - observational.length),
-    selectedIds
+    selectedIds,
+    config.deliveryScope,
+    config.topicSignature
   );
 
   return {
@@ -804,7 +855,7 @@ async function selectDigestItems(env, primaryItems, config, chatId) {
   };
 }
 
-async function pickUnsents(env, chatId, items, limit, selectedIds) {
+async function pickUnsents(env, items, limit, selectedIds, deliveryScope, topicSignature) {
   const picked = [];
 
   for (const item of items) {
@@ -817,7 +868,7 @@ async function pickUnsents(env, chatId, items, limit, selectedIds) {
       continue;
     }
 
-    const alreadySent = await env.MEDBOT_KV.get(sentKeyForChat(chatId, item.db, item.id));
+    const alreadySent = await env.MEDBOT_KV.get(sentKey(deliveryScope, topicSignature, item.db, item.id));
     if (alreadySent) {
       continue;
     }
@@ -829,10 +880,17 @@ async function pickUnsents(env, chatId, items, limit, selectedIds) {
   return picked;
 }
 
-async function selectAllMatchingItems(env, primaryItems, config, chatId) {
+async function selectAllMatchingItems(env, primaryItems, config) {
   const selectedIds = new Set();
   const candidates = primaryItems.filter((item) => item.title);
-  const articles = await pickUnsents(env, chatId, candidates, config.digestMaxArticles, selectedIds);
+  const articles = await pickUnsents(
+    env,
+    candidates,
+    config.digestMaxArticles,
+    selectedIds,
+    config.deliveryScope,
+    config.topicSignature
+  );
 
   return {
     highEvidence: articles,
@@ -843,11 +901,12 @@ async function selectAllMatchingItems(env, primaryItems, config, chatId) {
   };
 }
 
-function formatDigest(selection, discovery, config, topics, mode = 'scored') {
-  const lines = ['Daily Research Digest', `Keywords: ${formatTopicList(topics)}`, ''];
+function formatDigest(selection, discovery, config, mode = 'scored') {
+  const topicList = formatTopicList(config.topicLabels);
+  const lines = [`MedBot Daily Digest: ${topicList}`, ''];
 
   if (selection.highEvidence.length === 0 && selection.observational.length === 0) {
-    lines.push(`No high-signal records matched your keywords in the last ${config.lookbackDays} days.`);
+    lines.push(`No high-signal records matched this week for ${topicList}.`);
     return lines.join('\n');
   }
 
@@ -856,7 +915,7 @@ function formatDigest(selection, discovery, config, topics, mode = 'scored') {
     lines.push(...formatPrimarySection(selection.highEvidence, 1));
     lines.push('');
     lines.push(`Discovery window: last ${config.lookbackDays} days`);
-    lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, topics)}`);
+    lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
@@ -867,7 +926,7 @@ function formatDigest(selection, discovery, config, topics, mode = 'scored') {
   lines.push(...formatPrimarySection(selection.observational, selection.highEvidence.length + 1));
   lines.push('');
   lines.push(`Discovery window: last ${config.lookbackDays} days`);
-  lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, topics)}`);
+  lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
 
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -898,19 +957,18 @@ function formatPrimarySection(items, startIndex) {
     }
 
     lines.push(`Record: ${item.sourceUrl}`);
+
     lines.push('');
     return lines;
   });
 }
 
-async function sendTelegramDigest(telegram, chatId, messageText, replyMarkup = null) {
+async function sendTelegramDigest(telegram, chatId, messageText) {
   const chunks = splitMessage(messageText, TELEGRAM_MESSAGE_LIMIT);
 
-  for (let index = 0; index < chunks.length; index += 1) {
-    const chunk = chunks[index];
+  for (const chunk of chunks) {
     const response = await telegram.sendMessage(chatId, chunk, {
       disable_web_page_preview: true,
-      ...(index === 0 && replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
 
     if (!response.ok) {
@@ -919,25 +977,6 @@ async function sendTelegramDigest(telegram, chatId, messageText, replyMarkup = n
   }
 
   return chunks.length;
-}
-
-async function sendTelegramText(telegram, chatId, text, replyToMessageId) {
-  const response = await telegram.sendMessage(String(chatId), text, {
-    ...(replyToMessageId
-      ? {
-          reply_parameters: {
-            message_id: replyToMessageId,
-          },
-        }
-      : {}),
-    reply_markup: buildCommandReplyMarkup(),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
-  }
-
-  return response;
 }
 
 function createTelegramClient(env) {
@@ -951,7 +990,117 @@ function createTelegramClient(env) {
         ...extra,
       });
     },
+    async editMessageText(chatId, messageId, text, extra = {}) {
+      return postJson(`${TELEGRAM_API_BASE}/bot${token}/editMessageText`, {
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        ...extra,
+      });
+    },
+    async answerCallbackQuery(callbackQueryId, text = '') {
+      return postJson(`${TELEGRAM_API_BASE}/bot${token}/answerCallbackQuery`, {
+        callback_query_id: callbackQueryId,
+        text,
+      });
+    },
   };
+}
+
+function approvedReplyKeyboard(isAdmin = false) {
+  const keyboard = [[{ text: 'Keywords' }, { text: 'Schedule' }], [{ text: 'My Settings' }, { text: 'Run Now' }]];
+  if (isAdmin) {
+    keyboard.push([{ text: 'Users' }, { text: 'Pending' }]);
+  }
+
+  return {
+    keyboard,
+    resize_keyboard: true,
+  };
+}
+
+async function sendTelegramOrThrow(telegram, chatId, text, replyMessageId, replyMarkup, parseMode = '') {
+  const response = await telegram.sendMessage(chatId, text, {
+    ...(replyMessageId
+      ? {
+          reply_parameters: {
+            message_id: replyMessageId,
+          },
+        }
+      : {}),
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram send failed: ${response.description || 'unknown error'}`);
+  }
+
+  return response;
+}
+
+async function handleTelegramCallbackQuery(callbackQuery, env) {
+  const telegram = createTelegramClient(env);
+  const data = cleanText(callbackQuery.data || '');
+  const fromChatId = cleanText(callbackQuery.from?.id || '');
+
+  if (!data) {
+    await telegram.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
+  if (!isAdminChat(env, fromChatId)) {
+    await telegram.answerCallbackQuery(callbackQuery.id, 'Unauthorized');
+    return;
+  }
+
+  const [action, targetChatId] = data.split(':');
+  if (!targetChatId || !['approve', 'reject'].includes(action)) {
+    await telegram.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
+  let user = await getUserProfile(env, targetChatId);
+  if (!user) {
+    user = await upsertUserProfile(env, { chatId: targetChatId, displayName: targetChatId }, { status: 'pending' });
+  }
+
+  if (action === 'approve') {
+    user = await updateUserStatus(env, user, 'approved');
+    await telegram.answerCallbackQuery(callbackQuery.id, 'Approved');
+    if (callbackQuery.message?.chat?.id && callbackQuery.message?.message_id) {
+      const refreshed = await buildUsersAdminMessage(
+        env,
+        String(callbackQuery.message.text || '').startsWith('Users') ? 'all' : 'pending'
+      );
+      await telegram.editMessageText(String(callbackQuery.message.chat.id), callbackQuery.message.message_id, refreshed.text, {
+        reply_markup: refreshed.reply_markup,
+      });
+    }
+    await setKeywordFlowState(env, targetChatId, { step: 'awaiting_terms' });
+    await sendTelegramOrThrow(
+      telegram,
+      targetChatId,
+      ['Your invitation was approved.', 'Send your keywords now.', 'Commas mean AND inside one query.', 'Use semicolons or new lines for multiple queries.'].join('\n'),
+      '',
+      approvedReplyKeyboard(false)
+    );
+    return;
+  }
+
+  user = await updateUserStatus(env, user, 'rejected');
+  await clearKeywordFlowState(env, targetChatId);
+  await telegram.answerCallbackQuery(callbackQuery.id, 'Rejected');
+  if (callbackQuery.message?.chat?.id && callbackQuery.message?.message_id) {
+    const refreshed = await buildUsersAdminMessage(
+      env,
+      String(callbackQuery.message.text || '').startsWith('Users') ? 'all' : 'pending'
+    );
+    await telegram.editMessageText(String(callbackQuery.message.chat.id), callbackQuery.message.message_id, refreshed.text, {
+      reply_markup: refreshed.reply_markup,
+    });
+  }
+  await sendTelegramOrThrow(telegram, targetChatId, 'Your invitation was rejected by the admin.');
 }
 
 async function postJson(url, payload) {
@@ -1090,9 +1239,14 @@ async function fetchWithRetry(url, options = {}) {
   throw lastError || new Error(`${errorLabel} failed`);
 }
 
-function getConfig(env) {
+function getConfig(env, options = {}) {
+  const requireDeliverySecrets = options.requireDeliverySecrets !== false;
+
   return {
     ncbiTool: env.NCBI_TOOL || 'MedBot',
+    adminChatId: env.TELEGRAM_CHAT_ID || '',
+    telegramChatId: requireDeliverySecrets ? requiredSecret(env.TELEGRAM_CHAT_ID, 'TELEGRAM_CHAT_ID') : env.TELEGRAM_CHAT_ID || '',
+    deliveryScope: 'global',
     digestMaxArticles: parseNumber(env.DIGEST_MAX_ARTICLES, 18),
     highEvidenceLimit: parseNumber(env.HIGH_EVIDENCE_LIMIT, 10),
     observationalLimit: parseNumber(env.OBSERVATIONAL_LIMIT, 5),
@@ -1105,8 +1259,42 @@ function getConfig(env) {
   };
 }
 
-function getPublicConfigFromEnv(env) {
-  return publicConfig(getConfig(env));
+async function loadUserRuntimeConfig(env, chatId) {
+  const config = getConfig(env, { requireDeliverySecrets: false });
+  const topicState = await getUserTopicsState(env, chatId);
+  const schedule = await getUserSchedule(env, chatId);
+
+  return {
+    ...config,
+    telegramChatId: chatId,
+    deliveryScope: chatId,
+    topics: topicState.topics,
+    topicTerms: topicState.terms,
+    topicLabels: topicState.topics.map((topic) => topic.label),
+    topicSignature: buildTopicSignature(topicState.topics),
+    usingFallbackTopics: topicState.usingFallbackTopics,
+    keywordsUpdatedAt: topicState.updatedAt,
+    keywordsUpdatedBy: topicState.updatedBy,
+    scheduleTime: schedule?.time || '',
+    scheduleEnabled: schedule?.enabled === true,
+    scheduleTimeZone: schedule?.timezone || SAUDI_TIME_ZONE,
+  };
+}
+
+async function loadRuntimeConfig(env, options = {}) {
+  const config = getConfig(env, options);
+  const topicState = await getTopicsState(env);
+
+  return {
+    ...config,
+    topics: topicState.topics,
+    topicTerms: topicState.terms,
+    topicLabels: topicState.topics.map((topic) => topic.label),
+    topicSignature: buildTopicSignature(topicState.topics),
+    usingFallbackTopics: topicState.usingFallbackTopics,
+    keywordsUpdatedAt: topicState.updatedAt,
+    keywordsUpdatedBy: topicState.updatedBy,
+  };
 }
 
 function publicConfig(config) {
@@ -1121,6 +1309,12 @@ function publicConfig(config) {
     wosDb: config.wosDb,
     wosRetmax: config.wosRetmax,
     wosSort: config.wosSort,
+    topicTerms: config.topicTerms,
+    topics: config.topicLabels,
+    topicSignature: config.topicSignature,
+    usingFallbackTopics: config.usingFallbackTopics,
+    keywordsUpdatedAt: config.keywordsUpdatedAt || '',
+    keywordsUpdatedBy: config.keywordsUpdatedBy || '',
   };
 }
 
@@ -1163,27 +1357,22 @@ async function recordError(env, error) {
   }
 }
 
-async function markSent(env, chatId, keys) {
+async function markSent(env, keys) {
   await Promise.all(
     uniqueStrings(keys).map((key) =>
-      env.MEDBOT_KV.put(sentKeyForChat(chatId, ...splitSentKey(key)), new Date().toISOString(), {
+      env.MEDBOT_KV.put(key, new Date().toISOString(), {
         expirationTtl: SENT_TTL_SECONDS,
       })
     )
   );
 }
 
-function sentKey(db, id) {
-  return `${db}:${id}`;
+function sentKey(deliveryScope, topicSignature, db, id) {
+  return `sent:${deliveryScope || 'global'}:${topicSignature}:${db}:${id}`;
 }
 
-function sentKeyForChat(chatId, db, id) {
-  return `sent:${chatId}:${db}:${id}`;
-}
-
-function splitSentKey(key) {
-  const [db, ...rest] = String(key).split(':');
-  return [db, rest.join(':')];
+function digestStorageKey(deliveryScope, topicSignature, digestDate) {
+  return `digest:${deliveryScope || 'global'}:${topicSignature}:${digestDate}`;
 }
 
 function buildSourceUrl(db, id) {
@@ -1259,13 +1448,430 @@ function buildWhySelected(item, { evidenceType, tier }) {
 }
 
 function formatDiscoverySummary(discovery, topics) {
-  return topics
-    .map((topic) => {
-      const counts = discovery[topic.label] || {};
-      const parts = [...PRIMARY_DATABASES, 'wos'].map((db) => `${db}:${counts[db] || 0}`);
-      return `${topic.label}(${parts.join(', ')})`;
+  return topics.map((topic) => {
+    const counts = discovery[topic.label] || {};
+    const parts = [...PRIMARY_DATABASES, 'wos'].map((db) => `${db}:${counts[db] || 0}`);
+    return `${topic.label}(${parts.join(', ')})`;
+  }).join(' | ');
+}
+
+function formatTopicList(topicLabels) {
+  const labels = uniqueStrings(topicLabels.map((topic) => cleanText(topic)));
+  if (labels.length === 0) {
+    return 'configured topics';
+  }
+  if (labels.length === 1) {
+    return labels[0];
+  }
+  if (labels.length === 2) {
+    return `${labels[0]} and ${labels[1]}`;
+  }
+  return `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`;
+}
+
+function formatKeywordStatus(config) {
+  const lines = [`Current keywords: ${formatTopicList(config.topicLabels)}`, `Signature: ${config.topicSignature}`];
+
+  if (config.usingFallbackTopics) {
+    lines.push('Source: fallback defaults');
+  } else {
+    lines.push('Source: Workers KV');
+  }
+
+  if (config.keywordsUpdatedAt) {
+    lines.push(`Updated: ${config.keywordsUpdatedAt}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function getTopicsState(env) {
+  const stored = await env.MEDBOT_KV.get(KEYWORDS_CONFIG_KEY, 'json').catch(() => null);
+  const storedTerms = normalizeKeywordTerms(stored?.terms || []);
+  const usingFallbackTopics = storedTerms.length === 0;
+  const terms = usingFallbackTopics ? DEFAULT_TOPIC_TERMS : storedTerms;
+
+  return {
+    terms,
+    topics: buildTopicsFromTerms(terms),
+    usingFallbackTopics,
+    updatedAt: usingFallbackTopics ? '' : cleanText(stored?.updatedAt || ''),
+    updatedBy: usingFallbackTopics ? '' : cleanText(stored?.updatedBy || ''),
+  };
+}
+
+async function getUserTopicsState(env, chatId) {
+  const stored = await env.MEDBOT_KV.get(userKeywordsKey(chatId), 'json').catch(() => null);
+  const storedTerms = normalizeKeywordTerms(stored?.terms || []);
+  const usingFallbackTopics = storedTerms.length === 0;
+  const terms = usingFallbackTopics ? DEFAULT_TOPIC_TERMS : storedTerms;
+
+  return {
+    terms,
+    topics: buildTopicsFromTerms(terms),
+    usingFallbackTopics,
+    updatedAt: usingFallbackTopics ? '' : cleanText(stored?.updatedAt || ''),
+    updatedBy: usingFallbackTopics ? '' : cleanText(stored?.updatedBy || ''),
+  };
+}
+
+async function saveKeywordTerms(env, terms, updatedBy) {
+  const normalizedTerms = normalizeKeywordTerms(terms);
+  if (normalizedTerms.length === 0) {
+    throw new Error('At least one keyword is required');
+  }
+
+  await env.MEDBOT_KV.put(
+    KEYWORDS_CONFIG_KEY,
+    JSON.stringify({
+      version: 1,
+      terms: normalizedTerms,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
     })
-    .join(' | ');
+  );
+}
+
+async function saveUserKeywordTerms(env, chatId, terms, updatedBy) {
+  const normalizedTerms = normalizeKeywordTerms(terms);
+  if (normalizedTerms.length === 0) {
+    throw new Error('At least one keyword is required');
+  }
+
+  await env.MEDBOT_KV.put(
+    userKeywordsKey(chatId),
+    JSON.stringify({
+      version: 1,
+      terms: normalizedTerms,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+    })
+  );
+}
+
+async function getUserSchedule(env, chatId) {
+  return env.MEDBOT_KV.get(userScheduleKey(chatId), 'json').catch(() => null);
+}
+
+async function saveUserSchedule(env, chatId, time) {
+  await env.MEDBOT_KV.put(
+    userScheduleKey(chatId),
+    JSON.stringify({
+      timezone: SAUDI_TIME_ZONE,
+      time,
+      enabled: true,
+      updatedAt: new Date().toISOString(),
+    })
+  );
+}
+
+async function getKeywordFlowState(env, chatId) {
+  return env.MEDBOT_KV.get(keywordFlowStateKey(chatId), 'json').catch(() => null);
+}
+
+async function setKeywordFlowState(env, chatId, state) {
+  await env.MEDBOT_KV.put(keywordFlowStateKey(chatId), JSON.stringify(state), {
+    expirationTtl: KEYWORD_FLOW_TTL_SECONDS,
+  });
+}
+
+async function clearKeywordFlowState(env, chatId) {
+  await env.MEDBOT_KV.delete(keywordFlowStateKey(chatId));
+}
+
+function keywordFlowStateKey(chatId) {
+  return `${KEYWORD_FLOW_STATE_PREFIX}${chatId}`;
+}
+
+function userProfileKey(chatId) {
+  return `${USER_KEY_PREFIX}${chatId}`;
+}
+
+function userKeywordsKey(chatId) {
+  return `${USER_KEY_PREFIX}${chatId}:keywords`;
+}
+
+function userScheduleKey(chatId) {
+  return `${USER_KEY_PREFIX}${chatId}:schedule`;
+}
+
+function lastRunStorageKey(chatId = '') {
+  return chatId ? `run:last:${chatId}` : 'run:last';
+}
+
+function scheduleLastSentKey(chatId, date) {
+  return `schedule:last-sent:${chatId}:${date}`;
+}
+
+async function getUserProfile(env, chatId) {
+  return env.MEDBOT_KV.get(userProfileKey(chatId), 'json').catch(() => null);
+}
+
+async function getUserIndex(env) {
+  const ids = await env.MEDBOT_KV.get(USERS_INDEX_KEY, 'json').catch(() => []);
+  return Array.isArray(ids) ? uniqueStrings(ids.map((value) => cleanText(value))) : [];
+}
+
+async function saveUserIndex(env, ids) {
+  await env.MEDBOT_KV.put(USERS_INDEX_KEY, JSON.stringify(uniqueStrings(ids.map((value) => cleanText(value)))));
+}
+
+async function appendUserIndex(env, chatId) {
+  const ids = await getUserIndex(env);
+  if (!ids.includes(chatId)) {
+    ids.push(chatId);
+    await saveUserIndex(env, ids);
+  }
+}
+
+async function saveUserProfile(env, profile) {
+  await appendUserIndex(env, profile.chatId);
+  await env.MEDBOT_KV.put(userProfileKey(profile.chatId), JSON.stringify(profile));
+  return profile;
+}
+
+async function upsertUserProfile(env, profile, overrides = {}) {
+  const now = new Date().toISOString();
+  const existing = await getUserProfile(env, profile.chatId);
+  const next = {
+    chatId: profile.chatId,
+    firstName: profile.firstName || existing?.firstName || '',
+    username: profile.username || existing?.username || '',
+    displayName: profile.displayName || existing?.displayName || profile.chatId,
+    status: overrides.status || existing?.status || 'pending',
+    joinedAt: existing?.joinedAt || now,
+    updatedAt: now,
+    approvedAt: existing?.approvedAt || '',
+    rejectedAt: existing?.rejectedAt || '',
+  };
+  return saveUserProfile(env, next);
+}
+
+async function updateUserStatus(env, user, status) {
+  const now = new Date().toISOString();
+  return saveUserProfile(env, {
+    ...user,
+    status,
+    updatedAt: now,
+    approvedAt: status === 'approved' ? now : user.approvedAt || '',
+    rejectedAt: status === 'rejected' ? now : user.rejectedAt || '',
+  });
+}
+
+async function listUsers(env, status = 'all') {
+  const userIds = await getUserIndex(env);
+  const users = await Promise.all(userIds.map((chatId) => getUserProfile(env, chatId)));
+  return users
+    .filter(Boolean)
+    .filter((user) => (status === 'all' ? true : user.status === status))
+    .sort((left, right) => String(left.joinedAt || '').localeCompare(String(right.joinedAt || '')));
+}
+
+function buildTelegramProfile(from, chatId) {
+  const firstName = cleanText(from?.first_name || '');
+  const username = cleanText(from?.username ? `@${from.username}` : '');
+  return {
+    chatId,
+    firstName,
+    username,
+    displayName: cleanText([firstName, username].filter(Boolean).join(' ')) || chatId,
+  };
+}
+
+function isAdminChat(env, chatId) {
+  return cleanText(env.TELEGRAM_CHAT_ID || '') === cleanText(chatId || '');
+}
+
+function accessStatusMessage(user) {
+  if (user?.status === 'pending') {
+    return 'Your access request is pending. Wait for admin approval.';
+  }
+  if (user?.status === 'rejected') {
+    return 'Your invitation was rejected. An admin can approve you later.';
+  }
+  return 'Use /join to request access.';
+}
+
+async function notifyAdminAboutJoinRequest(env, profile) {
+  const adminChatId = cleanText(env.TELEGRAM_CHAT_ID || '');
+  if (!adminChatId) {
+    return;
+  }
+
+  const telegram = createTelegramClient(env);
+  await sendTelegramOrThrow(
+    telegram,
+    adminChatId,
+    [`New join request`, `Name: ${profile.displayName}`, `Chat ID: ${profile.chatId}`].join('\n'),
+    '',
+    {
+      inline_keyboard: [[
+        { text: 'Approve', callback_data: `approve:${profile.chatId}` },
+        { text: 'Reject', callback_data: `reject:${profile.chatId}` },
+      ]],
+    }
+  );
+}
+
+async function buildUsersAdminMessage(env, status = 'all') {
+  const users = await listUsers(env, status);
+  if (users.length === 0) {
+    return {
+      text: status === 'pending' ? 'No pending users.' : 'No users found.',
+      reply_markup: { inline_keyboard: [] },
+    };
+  }
+
+  const lines = users.map((user) => `${formatUserStatus(user.status)} ${user.displayName} (${user.chatId})`);
+  const inline_keyboard = users.map((user) => {
+    const buttons = [];
+    if (user.status !== 'approved') {
+      buttons.push({ text: 'Approve', callback_data: `approve:${user.chatId}` });
+    }
+    if (user.status !== 'rejected') {
+      buttons.push({ text: 'Reject', callback_data: `reject:${user.chatId}` });
+    }
+    return buttons;
+  }).filter((row) => row.length > 0);
+
+  return {
+    text: `${status === 'pending' ? 'Pending' : 'Users'} (${users.length})\n\n${lines.join('\n')}`,
+    reply_markup: { inline_keyboard },
+  };
+}
+
+function formatUserStatus(status) {
+  if (status === 'approved') {
+    return 'APPROVED';
+  }
+  if (status === 'rejected') {
+    return 'REJECTED';
+  }
+  return 'PENDING';
+}
+
+async function formatUserSettings(env, chatId) {
+  const user = await getUserProfile(env, chatId);
+  const config = await loadUserRuntimeConfig(env, chatId);
+  const lastRun = await env.MEDBOT_KV.get(lastRunStorageKey(chatId), 'json').catch(() => null);
+
+  return [
+    `Status: ${formatUserStatus(user?.status || 'pending')}`,
+    `Keywords: ${formatTopicList(config.topicLabels)}`,
+    `Schedule: ${config.scheduleTime || 'Not set'} (${SAUDI_TIME_ZONE})`,
+    `Last run: ${cleanText(lastRun?.completedAt || '') || 'Never'}`,
+  ].join('\n');
+}
+
+function normalizeScheduleTime(value) {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(cleanText(value));
+  return match ? `${match[1]}:${match[2]}` : '';
+}
+
+function getTimeZoneNowParts(timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(new Date()).map((part) => [part.type, part.value]));
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    time: `${parts.hour}:${parts.minute}`,
+  };
+}
+
+function buildTopicsFromTerms(terms) {
+  return terms.map((term) => {
+    const normalizedTerm = cleanKeywordTerm(term);
+    const tokens = splitKeywordComponents(normalizedTerm);
+    const componentQueries = tokens.map((token) => {
+      const quotedToken = quoteTopicTerm(token);
+      return `(${quotedToken}[Title/Abstract] OR ${quotedToken}[MeSH Terms])`;
+    });
+    const broadQuery = tokens.map((token) => quoteTopicTerm(token)).join(' AND ');
+
+    return {
+      term: normalizedTerm,
+      label: formatTopicLabel(tokens),
+      query: componentQueries.join(' AND '),
+      broadQuery,
+      tokens,
+    };
+  });
+}
+
+function parseKeywordTermsInput(input) {
+  return normalizeKeywordTerms(input.split(/[\n;]+/));
+}
+
+function normalizeKeywordTerms(terms) {
+  const normalized = [];
+
+  for (const term of Array.isArray(terms) ? terms : []) {
+    const cleaned = cleanKeywordTerm(term);
+    if (!cleaned) {
+      continue;
+    }
+    if (normalized.some((existing) => existing.toLowerCase() === cleaned.toLowerCase())) {
+      continue;
+    }
+    normalized.push(cleaned);
+    if (normalized.length >= MAX_KEYWORD_TERMS) {
+      break;
+    }
+  }
+
+  return normalized;
+}
+
+function cleanKeywordTerm(value) {
+  return cleanText(
+    String(value || '')
+      .replace(/["']/g, '')
+      .split(',')
+      .map((part) => cleanText(part))
+      .filter(Boolean)
+      .join(', ')
+  );
+}
+
+function splitKeywordComponents(term) {
+  return term
+    .split(',')
+    .map((part) => cleanText(part))
+    .filter(Boolean);
+}
+
+function quoteTopicTerm(term) {
+  return `"${term.replace(/\\/g, '\\\\')}"`;
+}
+
+function formatTopicLabel(termOrTokens) {
+  const tokens = Array.isArray(termOrTokens) ? termOrTokens : splitKeywordComponents(termOrTokens);
+  return tokens
+    .map((token) =>
+      token
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ')
+    )
+    .join(' and ');
+}
+
+function formatAuthors(authors) {
+  if (!authors.length) {
+    return 'Unknown';
+  }
+  if (authors.length === 1) {
+    return authors[0];
+  }
+  return `${authors[0]} et al.`;
 }
 
 function buildSearchQuery(db, topic) {
@@ -1274,83 +1880,6 @@ function buildSearchQuery(db, topic) {
 
 function buildWosSearchQuery(topic) {
   return `TS=(${topic.broadQuery})`;
-}
-
-function buildTopicsFromKeywords(rawKeywords) {
-  const cleaned = cleanText(rawKeywords);
-  if (!cleaned) {
-    throw new Error('Keywords are required');
-  }
-
-  if (cleaned.length > MAX_KEYWORDS_LENGTH) {
-    throw new Error(`Keywords are too long. Keep them under ${MAX_KEYWORDS_LENGTH} characters.`);
-  }
-
-  if (cleaned.includes(',')) {
-    const parts = uniqueStrings(cleaned.split(',').map((part) => cleanText(part)));
-    if (!parts.length) {
-      throw new Error('Provide at least one keyword');
-    }
-    if (parts.length > MAX_USER_TOPICS) {
-      throw new Error(`Use up to ${MAX_USER_TOPICS} comma-separated keywords.`);
-    }
-
-    return parts.map((part) => {
-      const fieldTerm = formatFieldTerm(part);
-      const broadQuery = formatBroadTopicTerm(part);
-      return {
-        label: part,
-        query: `(${fieldTerm}[MeSH Terms] OR ${fieldTerm}[Title/Abstract])`,
-        broadQuery,
-      };
-    });
-  }
-
-  return [
-    {
-      label: truncateText(cleaned, 60),
-      query: cleaned,
-      broadQuery: cleaned,
-    },
-  ];
-}
-
-function formatFieldTerm(value) {
-  const cleaned = cleanText(value).replace(/"/g, '');
-  if (!cleaned) {
-    return '';
-  }
-  return /\s/.test(cleaned) ? `"${cleaned}"` : cleaned;
-}
-
-function formatBroadTopicTerm(value) {
-  const cleaned = cleanText(value).replace(/[()]/g, ' ');
-  if (!cleaned) {
-    return '';
-  }
-  return /\s/.test(cleaned) ? `"${cleaned}"` : cleaned;
-}
-
-function formatTopicList(topics) {
-  return topics.map((topic) => cleanText(topic.label)).filter(Boolean).join(', ');
-}
-
-function buildHelpMessage() {
-  return [
-    'Use one of these commands:',
-    '/start',
-    '/run',
-    '/changekeyword',
-    '/stop',
-  ].join('\n');
-}
-
-function buildCommandReplyMarkup() {
-  return {
-    keyboard: [[{ text: '/start' }, { text: '/run' }], [{ text: '/changekeyword' }, { text: '/stop' }]],
-    is_persistent: true,
-    resize_keyboard: true,
-  };
 }
 
 function splitMessage(text, limit) {
@@ -1528,6 +2057,20 @@ function extractWosTimesCited(citations) {
   return 0;
 }
 
+function isRecentWithinDays(dateText, days) {
+  if (!dateText) {
+    return false;
+  }
+
+  const date = new Date(dateText);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  const ageMs = Date.now() - date.getTime();
+  return ageMs >= 0 && ageMs <= days * 24 * 60 * 60 * 1000;
+}
+
 function groupBy(items, selector) {
   const grouped = new Map();
   for (const item of items) {
@@ -1549,6 +2092,25 @@ function chunkArray(items, size) {
 
 function uniqueStrings(values) {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function buildTopicSignature(topics) {
+  const source = JSON.stringify(
+    topics.map((topic) => ({
+      label: cleanText(topic.label),
+      query: cleanText(topic.query),
+      broadQuery: cleanText(topic.broadQuery),
+      tokens: uniqueStrings(Array.isArray(topic.tokens) ? topic.tokens.map((token) => cleanText(token)) : []),
+    }))
+  );
+
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return `t${(hash >>> 0).toString(36)}`;
 }
 
 function stringifyParams(params) {
@@ -1610,160 +2172,4 @@ function jsonResponse(payload, status = 200) {
       'content-type': 'application/json; charset=utf-8',
     },
   });
-}
-
-function userKey(chatId) {
-  return `${USER_PREFIX}${chatId}`;
-}
-
-function userDigestKey(chatId, digestDate) {
-  return `${USER_DIGEST_PREFIX}${chatId}:${digestDate}`;
-}
-
-function lastDigestPointerKey(chatId) {
-  return `${USER_LAST_PREFIX}${chatId}`;
-}
-
-function createSubscription(chatId) {
-  const now = new Date().toISOString();
-  return {
-    chatId: String(chatId),
-    active: true,
-    keywordsRaw: '',
-    topics: [],
-    state: 'awaiting_keywords',
-    createdAt: now,
-    updatedAt: now,
-    lastSentDate: '',
-  };
-}
-
-function normalizeSubscription(subscription, chatId) {
-  const base = createSubscription(chatId);
-  return {
-    ...base,
-    ...subscription,
-    chatId: String(subscription?.chatId || chatId),
-    active: Boolean(subscription?.active),
-    keywordsRaw: cleanText(subscription?.keywordsRaw || ''),
-    topics: Array.isArray(subscription?.topics)
-      ? subscription.topics
-          .map((topic) => ({
-            label: cleanText(topic?.label || ''),
-            query: cleanText(topic?.query || ''),
-            broadQuery: cleanText(topic?.broadQuery || ''),
-          }))
-          .filter((topic) => topic.label && topic.query && topic.broadQuery)
-      : [],
-    state: cleanText(subscription?.state || base.state) || base.state,
-    createdAt: cleanText(subscription?.createdAt || base.createdAt) || base.createdAt,
-    updatedAt: cleanText(subscription?.updatedAt || base.updatedAt) || base.updatedAt,
-    lastSentDate: cleanText(subscription?.lastSentDate || ''),
-  };
-}
-
-function publicSubscription(subscription) {
-  if (!subscription) {
-    return null;
-  }
-
-  return {
-    chatId: cleanText(subscription.chatId || ''),
-    active: Boolean(subscription.active),
-    keywordsRaw: cleanText(subscription.keywordsRaw || ''),
-    topics: Array.isArray(subscription.topics) ? subscription.topics : [],
-    state: cleanText(subscription.state || ''),
-    createdAt: cleanText(subscription.createdAt || ''),
-    updatedAt: cleanText(subscription.updatedAt || ''),
-    lastSentDate: cleanText(subscription.lastSentDate || ''),
-  };
-}
-
-async function getSubscription(env, chatId) {
-  const key = userKey(chatId);
-  const subscription = await env.MEDBOT_KV.get(key, 'json');
-  if (!subscription) {
-    return null;
-  }
-  return normalizeSubscription(subscription, chatId);
-}
-
-async function saveSubscription(env, subscription) {
-  const normalized = normalizeSubscription(subscription, subscription.chatId);
-  await env.MEDBOT_KV.put(userKey(normalized.chatId), JSON.stringify(normalized));
-  return normalized;
-}
-
-async function updateSubscriptionKeywords(env, subscription, rawKeywords) {
-  const topics = buildTopicsFromKeywords(rawKeywords);
-  return saveSubscription(env, {
-    ...subscription,
-    active: true,
-    keywordsRaw: cleanText(rawKeywords),
-    topics,
-    state: 'ready',
-    updatedAt: new Date().toISOString(),
-  });
-}
-
-async function listSubscriptions(env) {
-  const subscriptions = [];
-  let cursor;
-
-  while (true) {
-    const listed = await env.MEDBOT_KV.list({ prefix: USER_PREFIX, cursor });
-    for (const key of listed.keys || []) {
-      const chatId = key.name.slice(USER_PREFIX.length);
-      const subscription = await getSubscription(env, chatId);
-      if (subscription) {
-        subscriptions.push(subscription);
-      }
-    }
-
-    if (!listed.list_complete) {
-      cursor = listed.cursor;
-      continue;
-    }
-
-    return subscriptions;
-  }
-}
-
-async function resolveDigestTarget(env, payload, options = {}) {
-  const requireChatId = options.requireChatId === true;
-  const chatId = cleanText(payload?.chatId || '');
-
-  if (chatId) {
-    const subscription = await getSubscription(env, chatId);
-    if (!subscription) {
-      throw new Response('Subscription not found', { status: 404 });
-    }
-    if (!subscription.topics.length) {
-      throw new Response('Subscription has no keywords yet', { status: 400 });
-    }
-    return { subscription, topics: subscription.topics, keywordsRaw: subscription.keywordsRaw };
-  }
-
-  if (requireChatId) {
-    throw new Response('chatId is required', { status: 400 });
-  }
-
-  const keywordsRaw = cleanText(payload?.keywords || '');
-  if (!keywordsRaw) {
-    throw new Response('Provide either chatId or keywords', { status: 400 });
-  }
-
-  return {
-    subscription: null,
-    topics: buildTopicsFromKeywords(keywordsRaw),
-    keywordsRaw,
-  };
-}
-
-async function readJsonBody(request) {
-  const payload = await request.json().catch(() => null);
-  if (!payload || typeof payload !== 'object') {
-    throw new Response('Invalid JSON body', { status: 400 });
-  }
-  return payload;
 }

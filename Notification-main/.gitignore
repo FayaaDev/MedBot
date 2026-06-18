@@ -1,0 +1,28 @@
+# Credentials & secrets
+.env
+
+# Database (contains user chat IDs and case history)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+
+# Downloaded reports
+*.csv
+*.xlsx
+Investigations_Report*
+
+# Runtime files
+sehax.lock
+run.sh
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Claude Code
+.claude/

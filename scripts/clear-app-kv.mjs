@@ -2,8 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const APP_PREFIXES = ['sent:', 'digest:', 'user:', 'last:'];
-const APP_EXACT_KEYS = new Set(['run:last', 'error:last']);
+const APP_PREFIXES = ['sent:', 'digest:', 'user:', 'last:', 'run:last:', 'schedule:last-sent:', 'telegram:keyword-flow:'];
+const APP_EXACT_KEYS = new Set(['run:last', 'error:last', 'config:keywords', 'users:index']);
 
 function main() {
   const repoRoot = resolve(import.meta.dirname, '..');
