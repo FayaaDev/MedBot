@@ -2,8 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const APP_PREFIXES = ['sent:', 'digest:'];
-const APP_EXACT_KEYS = new Set(['run:last', 'error:last', 'config:keywords']);
+const APP_PREFIXES = ['sent:', 'digest:', 'user:', 'last:'];
+const APP_EXACT_KEYS = new Set(['run:last', 'error:last']);
 
 function main() {
   const repoRoot = resolve(import.meta.dirname, '..');
