@@ -16,6 +16,12 @@ const USER_KEY_PREFIX = 'user:';
 const USERS_INDEX_KEY = 'users:index';
 const SAUDI_TIME_ZONE = 'Asia/Riyadh';
 
+const MANUAL_DATE_RANGES = {
+  '30d': { label: '30 days', lookbackDays: 30, primaryRetmax: 25, wosRetmax: 10 },
+  '1y': { label: '1 year', lookbackDays: 365, primaryRetmax: 50, wosRetmax: 25 },
+  '5y': { label: '5 years', lookbackDays: 1825, primaryRetmax: 100, wosRetmax: 50 },
+};
+
 const DEFAULT_TOPIC_TERMS = ['malaria', 'plasmodium'];
 
 const PRIMARY_DATABASES = ['pubmed', 'pmc'];
@@ -346,9 +352,14 @@ async function handleTelegramWebhook(request, env) {
   }
 
   if (command === '/runnow' || normalizedText === 'run now') {
-    await sendTelegramOrThrow(telegram, chatId, 'Fetching articles now...', message.message_id, approvedReplyKeyboard(isAdmin));
-    const result = await runDigest(env, { reason: 'telegram-manual', deliver: true, chatId });
-    return jsonResponse({ ok: true, handled: '/runnow', result });
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      'Choose the article date range.',
+      message.message_id,
+      manualRunDateKeyboard()
+    );
+    return jsonResponse({ ok: true, handled: '/runnow' });
   }
 
   if (isAdmin && (command === '/users' || normalizedText === 'users')) {
@@ -383,10 +394,11 @@ async function handleTelegramWebhook(request, env) {
   return jsonResponse({ ok: true, ignored: true, command });
 }
 
-async function runDigest(env, { reason, deliver, mode = 'scored', chatId = '' }) {
-  const config = chatId
+async function runDigest(env, { reason, deliver, mode = 'scored', chatId = '', configOverrides = {} }) {
+  const baseConfig = chatId
     ? await loadUserRuntimeConfig(env, chatId)
     : await loadRuntimeConfig(env, { requireDeliverySecrets: deliver });
+  const config = { ...baseConfig, ...configOverrides };
   const startedAt = new Date().toISOString();
   const storageScope = chatId || '';
 
@@ -478,7 +490,7 @@ async function buildDigest(env, config, mode = 'scored') {
   const discoveryEntries = await Promise.all(config.topics.map((topic) => discoverTopic(entrez, wos, topic, config)));
   const discovery = Object.fromEntries(discoveryEntries.map((entry) => [entry.topic, entry.counts]));
 
-  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, DEFAULT_PRIMARY_RETMAX, config.topics, config.lookbackDays);
+  const primaryMatches = await collectSearchMatches(entrez, PRIMARY_DATABASES, config.primaryRetmax, config.topics, config.lookbackDays);
   const primaryItems = await enrichPrimaryRecords(entrez, primaryMatches, config);
   const wosPrimaryItems = wos ? await collectWosPrimaryItems(wos, config.topics, config) : [];
   const rankedPrimaryItems = [...primaryItems, ...wosPrimaryItems]
@@ -528,6 +540,8 @@ async function discoverTopic(entrez, wos, topic, config) {
         db,
         term: buildSearchQuery(db, topic),
         retmax: 0,
+        reldate: config.lookbackDays,
+        datetype: 'pdat',
       });
 
       return [db, Number(response?.esearchresult?.count || 0)];
@@ -824,7 +838,7 @@ async function selectDigestItems(env, primaryItems, config) {
   const highEvidence = await pickUnsents(
     env,
     highEvidenceCandidates,
-    config.highEvidenceLimit,
+    Math.min(config.highEvidenceLimit, articleLimit),
     selectedIds,
     config.deliveryScope,
     config.topicSignature
@@ -914,7 +928,7 @@ function formatDigest(selection, discovery, config, mode = 'scored') {
     lines.push('All Matching Articles');
     lines.push(...formatPrimarySection(selection.highEvidence, 1));
     lines.push('');
-    lines.push(`Discovery window: last ${config.lookbackDays} days`);
+    lines.push(`Discovery window: last ${config.lookbackLabel}`);
     lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
@@ -925,7 +939,7 @@ function formatDigest(selection, discovery, config, mode = 'scored') {
   lines.push('Observational Studies');
   lines.push(...formatPrimarySection(selection.observational, selection.highEvidence.length + 1));
   lines.push('');
-  lines.push(`Discovery window: last ${config.lookbackDays} days`);
+  lines.push(`Discovery window: last ${config.lookbackLabel}`);
   lines.push(`Signal snapshot: ${formatDiscoverySummary(discovery, config.topics)}`);
 
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -1019,6 +1033,16 @@ function approvedReplyKeyboard(isAdmin = false) {
   };
 }
 
+function manualRunDateKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: 'Last 30 days', callback_data: 'run:30d' },
+      { text: 'Last 1 year', callback_data: 'run:1y' },
+      { text: 'Last 5 years', callback_data: 'run:5y' },
+    ]],
+  };
+}
+
 async function sendTelegramOrThrow(telegram, chatId, text, replyMessageId, replyMarkup, parseMode = '') {
   const response = await telegram.sendMessage(chatId, text, {
     ...(replyMessageId
@@ -1046,6 +1070,32 @@ async function handleTelegramCallbackQuery(callbackQuery, env) {
 
   if (!data) {
     await telegram.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
+  const manualRange = MANUAL_DATE_RANGES[data.slice(4)];
+  if (data.startsWith('run:') && manualRange) {
+    const chatId = cleanText(callbackQuery.message?.chat?.id || fromChatId);
+    const user = await getUserProfile(env, chatId);
+    if (user?.status !== 'approved' && !isAdminChat(env, fromChatId)) {
+      await telegram.answerCallbackQuery(callbackQuery.id, 'Unauthorized');
+      return;
+    }
+
+    await telegram.answerCallbackQuery(callbackQuery.id, `Fetching the last ${manualRange.label}`);
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      `Fetching articles from the last ${manualRange.label}...`,
+      '',
+      approvedReplyKeyboard(isAdminChat(env, chatId))
+    );
+    await runDigest(env, {
+      reason: 'telegram-manual',
+      deliver: true,
+      chatId,
+      configOverrides: manualRange,
+    });
     return;
   }
 
@@ -1251,6 +1301,8 @@ function getConfig(env, options = {}) {
     highEvidenceLimit: parseNumber(env.HIGH_EVIDENCE_LIMIT, 10),
     observationalLimit: parseNumber(env.OBSERVATIONAL_LIMIT, 5),
     lookbackDays: parseNumber(env.ENTREZ_LOOKBACK_DAYS, 2),
+    lookbackLabel: formatLookbackLabel(parseNumber(env.ENTREZ_LOOKBACK_DAYS, 2)),
+    primaryRetmax: DEFAULT_PRIMARY_RETMAX,
     sendEmptyDigest: parseBoolean(env.SEND_EMPTY_DIGEST, false),
     wosEnabled: parseBoolean(env.WOS_ENABLED, true),
     wosDb: cleanText(env.WOS_DB || 'WOS') || 'WOS',
@@ -1304,6 +1356,7 @@ function publicConfig(config) {
     highEvidenceLimit: config.highEvidenceLimit,
     observationalLimit: config.observationalLimit,
     lookbackDays: config.lookbackDays,
+    primaryRetmax: config.primaryRetmax,
     sendEmptyDigest: config.sendEmptyDigest,
     wosEnabled: config.wosEnabled,
     wosDb: config.wosDb,
@@ -2008,6 +2061,16 @@ function buildDateRange(days) {
   const end = new Date();
   const start = new Date(end.getTime() - Math.max(0, days) * 24 * 60 * 60 * 1000);
   return `${start.toISOString().slice(0, 10)}+${end.toISOString().slice(0, 10)}`;
+}
+
+function formatLookbackLabel(days) {
+  if (days === 365) {
+    return '1 year';
+  }
+  if (days === 1825) {
+    return '5 years';
+  }
+  return `${days} days`;
 }
 
 function buildWosPubDate(source) {

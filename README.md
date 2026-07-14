@@ -96,10 +96,10 @@ npm run deploy
 - `Keywords`: shows the caller's current keywords, then asks whether to replace them
 - `Schedule`: updates the caller's daily delivery time in `Asia/Riyadh`
 - `My Settings`: shows the caller's current keyword and schedule settings
-- `Run Now`: manually fetches articles immediately for the caller
+- `Run Now`: presents 30-day, 1-year, and 5-year choices before manually fetching articles for the caller
 - `Users` and `Pending`: admin-only subscriber lists with approve/reject buttons
 
-Approved users get a reply keyboard with `Keywords`, `Schedule`, `My Settings`, and `Run Now`. The admin also gets `Users` and `Pending`.
+Approved users get a reply keyboard with `Keywords`, `Schedule`, `My Settings`, and `Run Now`. `Run Now` only affects that manual request: scheduled digests continue to use the configured lookback window. Manual searches return up to 10 unsent articles; longer ranges search a larger bounded candidate pool. The admin also gets `Users` and `Pending`.
 
 To enable the chat command, point your Telegram bot webhook at:
 
