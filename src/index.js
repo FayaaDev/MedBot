@@ -217,6 +217,24 @@ async function handleTelegramWebhook(request, env) {
     return jsonResponse({ ok: true, handled: '/join', status: profile.status });
   }
 
+  if (command === '/stop' || normalizedText === 'stop') {
+    if (user?.status !== 'approved' && !isAdmin) {
+      await sendTelegramOrThrow(telegram, chatId, accessStatusMessage(user), message.message_id);
+      return jsonResponse({ ok: true, handled: 'access:gate', status: user?.status || 'new' });
+    }
+
+    await disableUserSchedule(env, chatId);
+    await clearKeywordFlowState(env, chatId);
+    await sendTelegramOrThrow(
+      telegram,
+      chatId,
+      'Scheduled digests stopped. Use /schedule to set a time and resume them.',
+      message.message_id,
+      approvedReplyKeyboard(isAdmin)
+    );
+    return jsonResponse({ ok: true, handled: '/stop' });
+  }
+
   if (flowState?.step === 'confirm_keywords') {
     if (normalizedText === 'no' || normalizedText === 'n') {
       await clearKeywordFlowState(env, chatId);
@@ -1618,6 +1636,19 @@ async function saveUserSchedule(env, chatId, time) {
   );
 }
 
+async function disableUserSchedule(env, chatId) {
+  const schedule = await getUserSchedule(env, chatId);
+  await env.MEDBOT_KV.put(
+    userScheduleKey(chatId),
+    JSON.stringify({
+      timezone: schedule?.timezone || SAUDI_TIME_ZONE,
+      time: schedule?.time || '',
+      enabled: false,
+      updatedAt: new Date().toISOString(),
+    })
+  );
+}
+
 async function getKeywordFlowState(env, chatId) {
   return env.MEDBOT_KV.get(keywordFlowStateKey(chatId), 'json').catch(() => null);
 }
@@ -1811,7 +1842,7 @@ async function formatUserSettings(env, chatId) {
   return [
     `Status: ${formatUserStatus(user?.status || 'pending')}`,
     `Keywords: ${formatTopicList(config.topicLabels)}`,
-    `Schedule: ${config.scheduleTime || 'Not set'} (${SAUDI_TIME_ZONE})`,
+    `Schedule: ${config.scheduleEnabled ? config.scheduleTime : 'Stopped'} (${SAUDI_TIME_ZONE})`,
     `Last run: ${cleanText(lastRun?.completedAt || '') || 'Never'}`,
   ].join('\n');
 }
