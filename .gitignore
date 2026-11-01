@@ -2,6 +2,13 @@ node_modules/
 .wrangler/
 npm-debug.log*
 .env
+.env.*
+!.env.example
+.dev.vars*
+.ssh
+__pycache__/
+*.py[cod]
+asreview/asreview-output/
 .DS_Store
 *:Zone.Identifier
 AGENTS.md

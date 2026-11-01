@@ -139,7 +139,7 @@ async function handleTelegramWebhook(request, env) {
   const chatId = cleanText(message?.chat?.id || '');
   const text = String(message?.text || '').trim();
 
-  if (!chatId || !text) {
+  if (!chatId || (!text && !message?.document)) {
     return jsonResponse({ ok: true, ignored: true });
   }
 
@@ -233,6 +233,98 @@ async function handleTelegramWebhook(request, env) {
       approvedReplyKeyboard(isAdmin)
     );
     return jsonResponse({ ok: true, handled: '/stop' });
+  }
+
+  if ((command === '/onetime' || normalizedText === 'one-time') && (user?.status === 'approved' || isAdmin)) {
+    await setKeywordFlowState(env, chatId, { step: 'one_time_terms' });
+    await sendTelegramOrThrow(telegram, chatId, 'Send keywords for this one-time search. Commas mean AND; use semicolons or new lines for multiple queries. Send cancel to stop.', message.message_id, approvedReplyKeyboard(isAdmin));
+    return jsonResponse({ ok: true, handled: 'one-time' });
+  }
+
+  if ((normalizedText === 'main menu' || command === '/menu') && (user?.status === 'approved' || isAdmin)) {
+    await clearKeywordFlowState(env, chatId);
+    await sendTelegramOrThrow(telegram, chatId, 'Choose an option.', message.message_id, approvedReplyKeyboard(isAdmin));
+    return jsonResponse({ ok: true, handled: 'menu' });
+  }
+
+  if ((normalizedText === 'cron' || command === '/cron') && (user?.status === 'approved' || isAdmin)) {
+    await clearKeywordFlowState(env, chatId);
+    const keyboard = [[{ text: 'Keywords' }, { text: 'Schedule' }], [{ text: 'My Settings' }, { text: 'Run Now' }], [{ text: 'Main Menu' }]];
+    if (isAdmin) keyboard.push([{ text: 'Users' }, { text: 'Pending' }]);
+    await sendTelegramOrThrow(telegram, chatId, await formatUserSettings(env, chatId), message.message_id, {
+      keyboard,
+      resize_keyboard: true,
+    });
+    return jsonResponse({ ok: true, handled: 'cron' });
+  }
+
+  if (normalizedText === 'review articles' || command === '/review') {
+    if (user?.status !== 'approved' && !isAdmin) {
+      await sendTelegramOrThrow(telegram, chatId, accessStatusMessage(user), message.message_id);
+      return jsonResponse({ ok: true, handled: 'access:gate' });
+    }
+    await setKeywordFlowState(env, chatId, { step: 'review_source' });
+    await sendTelegramOrThrow(telegram, chatId, 'Send a PDF document, public article URL, or DOI. Send cancel to stop.', message.message_id, approvedReplyKeyboard(isAdmin));
+    return jsonResponse({ ok: true, handled: 'review:start' });
+  }
+
+  if (flowState?.step === 'review_source' || flowState?.step === 'review_refs') {
+    if (user?.status !== 'approved' && !isAdmin) {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, accessStatusMessage(user), message.message_id);
+      return jsonResponse({ ok: true, handled: 'access:gate' });
+    }
+    if (normalizedText === 'cancel' || command === '/cancel') {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, 'Review cancelled.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'review:cancel' });
+    }
+    if (flowState.step === 'review_source') {
+      const document = message.document;
+      const isPdf = document?.file_id && (document.mime_type === 'application/pdf' || /\.pdf$/i.test(document.file_name || ''));
+      const isUrl = /^https?:\/\/\S+$/i.test(text) || /^10\.\d{4,9}\/\S+$/i.test(text);
+      if (!isPdf && !isUrl) {
+        await sendTelegramOrThrow(telegram, chatId, 'Send a PDF document, public HTTP(S) URL, or DOI, or cancel.', message.message_id);
+        return jsonResponse({ ok: true, handled: 'review:source', updated: false });
+      }
+      if (isPdf && document.file_size > 19 * 1024 * 1024) {
+        await sendTelegramOrThrow(telegram, chatId, 'PDF is too large. Send a PDF under 19 MiB, or a public URL.', message.message_id);
+        return jsonResponse({ ok: true, handled: 'review:source', updated: false });
+      }
+      await setKeywordFlowState(env, chatId, { step: 'review_refs', ...(isPdf ? { fileId: document.file_id } : { url: text }) });
+      await sendTelegramOrThrow(telegram, chatId, 'Send the included reference numbers, for example 15-25,31. Send cancel to stop.', message.message_id);
+      return jsonResponse({ ok: true, handled: 'review:source', updated: true });
+    }
+    if (!text || text.startsWith('/') || text.length > 4000 || !/^[\d,;\s-]+$/.test(text)) {
+      await sendTelegramOrThrow(telegram, chatId, 'Send reference numbers or ranges, for example 15-25,31, or cancel.', message.message_id);
+      return jsonResponse({ ok: true, handled: 'review:refs', updated: false });
+    }
+    await clearKeywordFlowState(env, chatId);
+    await processReview(env, telegram, chatId, flowState, text);
+    return jsonResponse({ ok: true, handled: 'review:process' });
+  }
+
+  if (flowState?.step === 'one_time_terms') {
+    if (user?.status !== 'approved' && !isAdmin) {
+      await sendTelegramOrThrow(telegram, chatId, accessStatusMessage(user), message.message_id);
+      return jsonResponse({ ok: true, handled: 'access:gate', status: user?.status || 'new' });
+    }
+    if (normalizedText === 'cancel') {
+      await clearKeywordFlowState(env, chatId);
+      await sendTelegramOrThrow(telegram, chatId, 'One-time search cancelled.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'one-time:cancel' });
+    }
+    if (text.startsWith('/')) {
+      return jsonResponse({ ok: true, ignored: true, command, pending: 'one-time' });
+    }
+    const terms = parseKeywordTermsInput(text);
+    if (!terms.length) {
+      await sendTelegramOrThrow(telegram, chatId, 'Send at least one query, or cancel.', message.message_id, approvedReplyKeyboard(isAdmin));
+      return jsonResponse({ ok: true, handled: 'one-time:terms', updated: false });
+    }
+    await setKeywordFlowState(env, chatId, { step: 'one_time_range', terms });
+    await sendTelegramOrThrow(telegram, chatId, 'Choose the article date range.', message.message_id, manualRunDateKeyboard('once'));
+    return jsonResponse({ ok: true, handled: 'one-time:terms', updated: true });
   }
 
   if (flowState?.step === 'confirm_keywords') {
@@ -859,7 +951,8 @@ async function selectDigestItems(env, primaryItems, config) {
     Math.min(config.highEvidenceLimit, articleLimit),
     selectedIds,
     config.deliveryScope,
-    config.topicSignature
+    config.topicSignature,
+    config.oneTime
   );
   const observational = await pickUnsents(
     env,
@@ -867,7 +960,8 @@ async function selectDigestItems(env, primaryItems, config) {
     Math.min(config.observationalLimit, Math.max(0, articleLimit - highEvidence.length)),
     selectedIds,
     config.deliveryScope,
-    config.topicSignature
+    config.topicSignature,
+    config.oneTime
   );
   const overflow = await pickUnsents(
     env,
@@ -875,7 +969,8 @@ async function selectDigestItems(env, primaryItems, config) {
     Math.max(0, articleLimit - highEvidence.length - observational.length),
     selectedIds,
     config.deliveryScope,
-    config.topicSignature
+    config.topicSignature,
+    config.oneTime
   );
 
   return {
@@ -887,7 +982,7 @@ async function selectDigestItems(env, primaryItems, config) {
   };
 }
 
-async function pickUnsents(env, items, limit, selectedIds, deliveryScope, topicSignature) {
+async function pickUnsents(env, items, limit, selectedIds, deliveryScope, topicSignature, oneTime = false) {
   const picked = [];
 
   for (const item of items) {
@@ -900,7 +995,7 @@ async function pickUnsents(env, items, limit, selectedIds, deliveryScope, topicS
       continue;
     }
 
-    const alreadySent = await env.MEDBOT_KV.get(sentKey(deliveryScope, topicSignature, item.db, item.id));
+    const alreadySent = !oneTime && await env.MEDBOT_KV.get(sentKey(deliveryScope, topicSignature, item.db, item.id));
     if (alreadySent) {
       continue;
     }
@@ -1011,10 +1106,64 @@ async function sendTelegramDigest(telegram, chatId, messageText) {
   return chunks.length;
 }
 
+async function processReview(env, telegram, chatId, state, refs) {
+  try {
+    let endpoint;
+    try {
+      endpoint = new URL('/process', env.ASREVIEW_URL);
+      if (endpoint.protocol !== 'https:') throw new Error();
+    } catch {
+      throw new Error('Review service is not configured with a valid HTTPS URL. Contact the admin.');
+    }
+    if (!env.ASREVIEW_TOKEN) throw new Error('Review service token is not configured. Contact the admin.');
+    const form = new FormData();
+    form.set('refs', refs);
+    form.set('telegram_token', requiredSecret(env.TELEGRAM_BOT_TOKEN, 'TELEGRAM_BOT_TOKEN'));
+    form.set('chat_id', chatId);
+    if (state.fileId) {
+      form.set('pdf', await telegram.downloadPdf(state.fileId), 'review.pdf');
+    } else {
+      form.set('url', state.url);
+    }
+    // A Blob gives the processor the Content-Length it requires.
+    const body = await new Response(form).blob();
+    const response = await fetch(endpoint.toString(), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${env.ASREVIEW_TOKEN}`, 'content-type': body.type },
+      body,
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      const message = response.status >= 500 || response.status === 401
+        ? `Review service failed (HTTP ${response.status}).`
+        : `Review failed: ${String(detail?.error || `HTTP ${response.status}`).slice(0, 300)}`;
+      throw new Error(message);
+    }
+    const result = await response.json().catch(() => null);
+    if (response.status !== 202 || result?.accepted !== true) {
+      throw new Error('Review service returned an unexpected response.');
+    }
+    await sendTelegramOrThrow(telegram, chatId, 'Review accepted. The CSV or an error will be sent when processing finishes.');
+  } catch (error) {
+    const message = error.message?.startsWith('Review') || error.message?.startsWith('Telegram')
+      ? error.message : 'Review processing failed. Check the PDF or URL and try again.';
+    await sendTelegramOrThrow(telegram, chatId, `${message} Start Review Articles to try again.`);
+  }
+}
+
 function createTelegramClient(env) {
   const token = requiredSecret(env.TELEGRAM_BOT_TOKEN, 'TELEGRAM_BOT_TOKEN');
 
   return {
+    async downloadPdf(fileId) {
+      const file = await postJson(`${TELEGRAM_API_BASE}/bot${token}/getFile`, { file_id: fileId });
+      if (!file.ok || !file.result?.file_path) throw new Error('Telegram could not retrieve the PDF.');
+      const response = await fetch(`${TELEGRAM_API_BASE}/file/bot${token}/${file.result.file_path}`);
+      if (!response.ok) throw new Error('Telegram could not download the PDF.');
+      const pdf = await response.blob();
+      if (pdf.size > 19 * 1024 * 1024) throw new Error('Review PDF is too large. Send a PDF under 19 MiB, or a public URL.');
+      return pdf;
+    },
     async sendMessage(chatId, text, extra = {}) {
       return postJson(`${TELEGRAM_API_BASE}/bot${token}/sendMessage`, {
         chat_id: chatId,
@@ -1040,10 +1189,7 @@ function createTelegramClient(env) {
 }
 
 function approvedReplyKeyboard(isAdmin = false) {
-  const keyboard = [[{ text: 'Keywords' }, { text: 'Schedule' }], [{ text: 'My Settings' }, { text: 'Run Now' }]];
-  if (isAdmin) {
-    keyboard.push([{ text: 'Users' }, { text: 'Pending' }]);
-  }
+  const keyboard = [[{ text: 'Cron' }, { text: 'One-time' }, { text: 'Review Articles' }]];
 
   return {
     keyboard,
@@ -1051,12 +1197,12 @@ function approvedReplyKeyboard(isAdmin = false) {
   };
 }
 
-function manualRunDateKeyboard() {
+function manualRunDateKeyboard(prefix = 'run') {
   return {
     inline_keyboard: [[
-      { text: 'Last 30 days', callback_data: 'run:30d' },
-      { text: 'Last 1 year', callback_data: 'run:1y' },
-      { text: 'Last 5 years', callback_data: 'run:5y' },
+      { text: 'Last 30 days', callback_data: `${prefix}:30d` },
+      { text: 'Last 1 year', callback_data: `${prefix}:1y` },
+      { text: 'Last 5 years', callback_data: `${prefix}:5y` },
     ]],
   };
 }
@@ -1088,6 +1234,38 @@ async function handleTelegramCallbackQuery(callbackQuery, env) {
 
   if (!data) {
     await telegram.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+
+  if (data.startsWith('once:')) {
+    const range = MANUAL_DATE_RANGES[data.slice(5)];
+    const chatId = cleanText(callbackQuery.message?.chat?.id || '');
+    const user = await getUserProfile(env, chatId);
+    if (!chatId || fromChatId !== chatId || (user?.status !== 'approved' && !isAdminChat(env, chatId))) {
+      await telegram.answerCallbackQuery(callbackQuery.id, 'Unauthorized');
+      return;
+    }
+    const state = await getKeywordFlowState(env, chatId);
+    if (!range || state?.step !== 'one_time_range' || !state.terms?.length) {
+      await telegram.answerCallbackQuery(callbackQuery.id, 'Search expired. Start a new one-time search.');
+      return;
+    }
+    await telegram.answerCallbackQuery(callbackQuery.id, `Fetching the last ${range.label}`);
+    const topics = buildTopicsFromTerms(state.terms);
+    const config = {
+      ...await loadUserRuntimeConfig(env, chatId),
+      ...range,
+      lookbackLabel: range.label,
+      topics,
+      topicTerms: state.terms,
+      topicLabels: topics.map((topic) => topic.label),
+      topicSignature: buildTopicSignature(topics),
+      oneTime: true,
+    };
+    await sendTelegramOrThrow(telegram, chatId, `Fetching articles from the last ${range.label}...`, '', approvedReplyKeyboard(isAdminChat(env, chatId)));
+    const digest = await buildDigest(env, config);
+    await sendTelegramDigest(telegram, chatId, digest.messageText);
+    await clearKeywordFlowState(env, chatId);
     return;
   }
 

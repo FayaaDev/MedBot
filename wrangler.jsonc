@@ -3,6 +3,9 @@
 	"name": "medbot",
 	"main": "src/index.js",
 	"compatibility_date": "2026-05-01",
+	"triggers": {
+		"crons": ["* * * * *"]
+	},
 	"observability": {
 		"enabled": true,
 		"head_sampling_rate": 1
@@ -14,6 +17,7 @@
 		}
 	],
 	"vars": {
+		"ASREVIEW_URL": "https://medbot.fayaa92.sa",
 		"NCBI_TOOL": "MedBot",
 		"DIGEST_MAX_ARTICLES": "10",
 		"HIGH_EVIDENCE_LIMIT": "6",

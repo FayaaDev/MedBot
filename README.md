@@ -27,6 +27,8 @@ Set these with `wrangler secret put`:
 - `NCBI_EMAIL`
 - `ADMIN_TOKEN`
 
+For Review Articles, configure `ASREVIEW_URL` as the publicly reachable HTTPS origin of the processor and set `ASREVIEW_TOKEN` as a Worker secret matching the processor token. The processor must be deployed separately; see `asreview/README.md`. Approved users can choose Review Articles, send a PDF, article URL or DOI, then provide included reference numbers (for example `15-25,31`). Send `cancel` to abandon the conversation. The conversation expires after 10 minutes. The processor accepts the job and sends the result to Telegram in the background; unfinished jobs are lost if its container restarts. The Worker sends the bot token to the processor, so use a trusted HTTPS connection and avoid request-body logging.
+
 ## KV Setup
 Subscriber data is stored in `MEDBOT_KV` under per-user keys such as `user:<chatId>`, `user:<chatId>:keywords`, and `user:<chatId>:schedule`.
 
